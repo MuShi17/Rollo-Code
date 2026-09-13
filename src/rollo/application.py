@@ -1529,11 +1529,18 @@ class Application:
                     },
                 )
             else:
+                # ``dispatch_intent`` was already observed when this task
+                # started, yet the canonical ledger holds nothing about the run.
+                # D14 maps exactly that state to
+                # ``interrupted``/``run_dispatch_not_observed`` — and the
+                # recovery path in this module already classifies it that way,
+                # so claiming success here would both contradict recovery and
+                # report a run as successful with no evidence for it.
                 self.control.finalize_run(
                     run_id,
-                    status="succeeded",
-                    error_code=None,
-                    result={"completed": True},
+                    status="interrupted",
+                    error_code="run_dispatch_not_observed",
+                    result={"side_effect_count": 0},
                 )
         except asyncio.CancelledError:
             self.control.update_run(run_id, status="cancelled" if run_id in self._cancel_requested else "interrupted", error_code="cancelled" if run_id in self._cancel_requested else "run_interrupted_before_dispatch")

@@ -18,8 +18,6 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-import pytest
-
 from rollo.application import Application, ControlStore
 from rollo.project_context import ProjectContext
 from rollo.runtime_event import RuntimeEvent
@@ -58,6 +56,12 @@ class _NonCanonicalAgent:
         return None
 
     async def chat(self, prompt: str) -> None:
+        # ``canonical-ok`` records the run terminal the way the shipped Agent
+        # does.  Anything else stays silent, which is the lost-evidence shape.
+        if prompt == "canonical-ok":
+            _write_canonical_terminal(
+                self._runtime_store, self.kwargs["runtime_session_id"], self.kwargs["runtime_run_id"]
+            )
         return None
 
     def abort(self) -> None:
@@ -67,6 +71,46 @@ class _NonCanonicalAgent:
         store, self._runtime_store = self._runtime_store, None
         if store is not None:
             store.close()
+
+
+def _write_canonical_terminal(store: SQLiteRuntimeStore, session_id: str, run_id: str) -> None:
+    """Record an invocation open plus a completed run terminal.
+
+    The canonical ledger is the only evidence the Application accepts, so a
+    double that wants to be reported as ``succeeded`` has to record it here
+    rather than have the Application assume it.
+    """
+
+    common = {
+        "schema_version": 2,
+        "session_id": session_id,
+        "run_id": run_id,
+        "invocation_id": "inv-fixture",
+        "turn_id": "turn-fixture",
+        "ts": 1,
+        "partial": False,
+        "author": "agent",
+    }
+    store.append(RuntimeEvent.from_dict({
+        **common,
+        "id": "fixture-invocation-opened",
+        "role": "system",
+        "content": {
+            "kind": "invocation_opened",
+            "protocol": "invocation_opened_v1",
+            "route": {"provider": "fixture", "model": "fixture-model"},
+            "configuration": {"attempt": 1},
+            "root": {"kind": "agent"},
+            "source": {"kind": "fresh"},
+        },
+    }))
+    store.append(RuntimeEvent.from_dict({
+        **common,
+        "id": "fixture-run-terminal",
+        "role": "model",
+        "status": "completed",
+        "actions": {"run_terminal": {"status": "completed"}},
+    }))
 
 
 def _invocation_opened(session_id: str, run_id: str) -> RuntimeEvent:
@@ -109,23 +153,13 @@ def _run_terminal(session_id: str, run_id: str) -> RuntimeEvent:
     })
 
 
-@pytest.mark.skip(
-    reason=(
-        "OPEN P0 (round-3 review C03-ADV-MUTATION-REVIEW-20260913-03): with "
-        "`dispatch_intent` observed and an empty canonical ledger, "
-        "`Application._execute_run` finalises the run as `succeeded` and never "
-        "consults `project_canonical_evidence`. The frozen D14 row "
-        "(runtime-control-persistence/spec.md:89, barrier B2) requires "
-        "`interrupted`/`run_dispatch_not_observed`, which is also what this same "
-        "module's recovery path returns for identical evidence. Un-skip once the "
-        "agent_factory/ledger contract is decided."
-    )
-)
 def test_empty_ledger_never_reports_success(tmp_path: Path):
     """dispatch_intent + zero canonical evidence -> interrupted, not succeeded.
 
-    Enable this as the regression oracle for the P0 above. It is skipped, not
-    deleted, so the gap stays visible and the fix has a ready test.
+    Regression oracle for the round-3 P0: the live path used to finalise an
+    empty ledger as ``succeeded`` while this module's recovery path classified
+    identical evidence as ``interrupted``/``run_dispatch_not_observed`` (frozen
+    D14, barrier B2).  Success is never reported without evidence naming the run.
     """
 
     async def scenario():
@@ -226,7 +260,7 @@ def test_crashed_process_never_blocks_the_workspace(tmp_path: Path):
             #    workspace is accepted and executed without any operator action.
             session = app.session_create("session-after-crash").session_id
             started = await app.run_start(
-                session_id=session, prompt="hi", command_id="after-crash-cmd"
+                session_id=session, prompt="canonical-ok", command_id="after-crash-cmd"
             )
             assert started.error_code is None, started
             assert (await app.wait_run(started.run_id)).status == "succeeded"
@@ -263,7 +297,7 @@ def test_stale_session_lease_is_reclaimed_without_operator_action(tmp_path: Path
         app = Application(context, agent_factory=_NonCanonicalAgent, control_store=store)
         try:
             session = app.session_create(session_id).session_id
-            started = await app.run_start(session_id=session, prompt="hi", command_id="stale-cmd")
+            started = await app.run_start(session_id=session, prompt="canonical-ok", command_id="stale-cmd")
             assert started.error_code is None, started
             assert (await app.wait_run(started.run_id)).status == "succeeded"
             # The lease was adopted and then released by its new holder.

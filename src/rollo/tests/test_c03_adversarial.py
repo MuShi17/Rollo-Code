@@ -27,6 +27,14 @@ class _BlockingAgent:
         if prompt == "block":
             assert self.__class__.gate is not None
             await self.__class__.gate.wait()
+        # Success is reported only from canonical evidence naming this run, so
+        # the double records the terminal the way the shipped Agent does.
+        if self.runtime_store is not None:
+            _write_canonical_terminal(
+                self.runtime_store,
+                self.kwargs["runtime_session_id"],
+                self.kwargs["runtime_run_id"],
+            )
 
     def abort(self):
         # Cross-Application cancellation cannot call this instance directly;
@@ -35,6 +43,41 @@ class _BlockingAgent:
 
     async def aclose(self):
         return None
+
+
+def _write_canonical_terminal(store, session_id: str, run_id: str) -> None:
+    """Record an invocation open plus a completed run terminal."""
+
+    common = {
+        "schema_version": 2,
+        "session_id": session_id,
+        "run_id": run_id,
+        "invocation_id": "inv-fixture",
+        "turn_id": "turn-fixture",
+        "ts": 1,
+        "partial": False,
+        "author": "agent",
+    }
+    store.append(RuntimeEvent.from_dict({
+        **common,
+        "id": "fixture-invocation-opened",
+        "role": "system",
+        "content": {
+            "kind": "invocation_opened",
+            "protocol": "invocation_opened_v1",
+            "route": {"provider": "fixture", "model": "fixture-model"},
+            "configuration": {"attempt": 1},
+            "root": {"kind": "agent"},
+            "source": {"kind": "fresh"},
+        },
+    }))
+    store.append(RuntimeEvent.from_dict({
+        **common,
+        "id": "fixture-run-terminal",
+        "role": "model",
+        "status": "completed",
+        "actions": {"run_terminal": {"status": "completed"}},
+    }))
 
 
 class _CanonicalAgent:

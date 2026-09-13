@@ -63,12 +63,54 @@ class _RecordingAgent:
                 if time.monotonic() > deadline:
                     return
                 await asyncio.sleep(0.02)
+        # Once the hold is released the run ends normally, so the double records
+        # the canonical terminal the way the shipped Agent does -- success is
+        # reported only from evidence that names the run.
+        if prompt in {"hold", "side-effect"} and self.runtime_store is not None:
+            _canonical_terminal(self.runtime_store, self.session_id, self.run_id)
 
     def abort(self) -> None:
         return None
 
     async def aclose(self) -> None:
         return None
+
+
+def _canonical_terminal(store: Any, session_id: str, run_id: str) -> None:
+    """Record an invocation open plus a completed run terminal."""
+
+    from rollo.runtime_event import RuntimeEvent
+
+    common = {
+        "schema_version": 2,
+        "session_id": session_id,
+        "run_id": run_id,
+        "invocation_id": "inv-fixture",
+        "turn_id": "turn-fixture",
+        "ts": 1,
+        "partial": False,
+        "author": "agent",
+    }
+    store.append(RuntimeEvent.from_dict({
+        **common,
+        "id": "fixture-invocation-opened",
+        "role": "system",
+        "content": {
+            "kind": "invocation_opened",
+            "protocol": "invocation_opened_v1",
+            "route": {"provider": "fixture", "model": "fixture-model"},
+            "configuration": {"attempt": 1},
+            "root": {"kind": "agent"},
+            "source": {"kind": "fresh"},
+        },
+    }))
+    store.append(RuntimeEvent.from_dict({
+        **common,
+        "id": "fixture-run-terminal",
+        "role": "model",
+        "status": "completed",
+        "actions": {"run_terminal": {"status": "completed"}},
+    }))
 
 
 def _open_event(session_id: str, run_id: str) -> Any:

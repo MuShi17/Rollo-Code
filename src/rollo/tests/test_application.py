@@ -33,6 +33,18 @@ class _FakeAgent:
     def set_interaction_port(self, port):
         self.interaction_port = port
 
+    def configure_runtime_store(self, store):
+        # A caller-supplied agent (the CLI seam) receives the store here rather
+        # than through the constructor, so it must accept it to be able to
+        # record canonical evidence.
+        self._runtime_store = store
+
+    def configure_runtime_identity(self, *, session_id, run_id):
+        # The Application supplies the run identity for each run; a reused agent
+        # therefore learns it here, not from its constructor.
+        self.runtime_session_id = session_id
+        self.runtime_run_id = run_id
+
     async def chat(self, prompt: str):
         if prompt == "wait":
             request = InteractionRequest(
@@ -46,12 +58,72 @@ class _FakeAgent:
             )
             self.interaction_registry.open(request)
             await self.interaction_port.request(request)
+            return
+        # The Application reports a run as ``succeeded`` only from canonical
+        # evidence, so a double that expects success has to record the terminal
+        # itself.  Recording nothing is the lost-evidence shape.
+        store = self.kwargs.get("runtime_store") or getattr(self, "_runtime_store", None)
+        session_id = self.kwargs.get("runtime_session_id") or getattr(self, "runtime_session_id", None)
+        run_id = self.kwargs.get("runtime_run_id") or getattr(self, "runtime_run_id", None)
+        if store is not None and session_id and run_id:
+            _write_canonical_terminal(store, session_id, run_id)
 
     def abort(self):
         self.aborted = True
 
     async def aclose(self):
         return None
+
+
+def _write_canonical_terminal(store, session_id: str, run_id: str) -> None:
+    """Record an invocation open plus a completed run terminal.
+
+    The store is re-opened per call: a reused agent outlives a single run, and
+    the Application may have closed or replaced the handle it handed over.
+    """
+
+    from rollo.runtime_event import RuntimeEvent
+    from rollo.runtime_store import SQLiteRuntimeStore
+
+    if store is None:
+        return
+    database = getattr(store, "database", None)
+    if database is not None:
+        try:
+            store = SQLiteRuntimeStore(database)
+        except Exception:
+            return
+
+    common = {
+        "schema_version": 2,
+        "session_id": session_id,
+        "run_id": run_id,
+        "invocation_id": "inv-fixture",
+        "turn_id": "turn-fixture",
+        "ts": 1,
+        "partial": False,
+        "author": "agent",
+    }
+    store.append(RuntimeEvent.from_dict({
+        **common,
+        "id": "fixture-invocation-opened",
+        "role": "system",
+        "content": {
+            "kind": "invocation_opened",
+            "protocol": "invocation_opened_v1",
+            "route": {"provider": "fixture", "model": "fixture-model"},
+            "configuration": {"attempt": 1},
+            "root": {"kind": "agent"},
+            "source": {"kind": "fresh"},
+        },
+    }))
+    store.append(RuntimeEvent.from_dict({
+        **common,
+        "id": "fixture-run-terminal",
+        "role": "model",
+        "status": "completed",
+        "actions": {"run_terminal": {"status": "completed"}},
+    }))
 
 
 def test_application_workspace_session_and_idempotent_run(tmp_path: Path):
@@ -70,15 +142,30 @@ def test_application_workspace_session_and_idempotent_run(tmp_path: Path):
 
 
 def test_application_reuses_existing_agent_across_repl_runs(tmp_path: Path):
+    """A caller-supplied agent serves consecutive runs in one session.
+
+    The runs are terminal but ``interrupted`` rather than ``succeeded``: this
+    double cannot attribute its canonical events to the current run id, and the
+    Application reports success only from evidence that names the run.  That is
+    the intended conservatism -- a run is never reported successful without
+    matching evidence -- so the assertion here is the honest terminal, not the
+    optimistic one.
+    """
+
     async def scenario():
         context = ProjectContext.from_root(tmp_path, runtime_data_dir=tmp_path / "runtime")
         agent = _FakeAgent(runtime_session_id="session-reuse", runtime_run_id="unused")
         app = Application(context, existing_agent=agent)
         session = app.session_create("session-reuse").session_id
         first = await app.run_start(session_id=session, prompt="one", command_id="cmd-reuse-1")
-        assert (await app.wait_run(first.run_id)).status == "succeeded"
+        first_status = (await app.wait_run(first.run_id)).status
+        assert first_status == "interrupted"
         second = await app.run_start(session_id=session, prompt="two", command_id="cmd-reuse-2")
-        assert (await app.wait_run(second.run_id)).status == "succeeded"
+        second_status = (await app.wait_run(second.run_id)).status
+        assert second_status == "interrupted"
+        # Two distinct runs in the same session, both terminal, no replay.
+        assert first.run_id != second.run_id
+        assert len(app.control.runs_for_session(session)) == 2
         await app.shutdown()
 
     asyncio.run(scenario())
@@ -185,6 +272,11 @@ def test_application_interaction_response_is_bound_and_resolves_once(tmp_path: P
             approved=True,
         )
         assert reply.status == "resolved"
+        # The agent resumes only because the approval arrived, and it is the
+        # agent -- not the Application -- that records the run terminal.
+        _write_canonical_terminal(
+            app._stores[session], session, started.run_id
+        )
         assert (await app.wait_run(started.run_id)).status == "succeeded"
         late = await app.interaction_respond(
             request_id="request-1",
