@@ -1148,6 +1148,25 @@ class Application:
                 await task
         return self.run_status(run_id)
 
+    def runs_list(self, session_id: str) -> ApplicationResponse:
+        """List the control records of every run in one session.
+
+        A pure read of the already-existing ``ControlStore.runs_for_session``:
+        a reconnecting consumer needs to enumerate a session's runs before it
+        can see the pending interactions attached to them.  This adds no
+        behaviour and changes no existing method.
+        """
+
+        self._ensure_open()
+        runs = [dict(row) for row in self.control.runs_for_session(session_id)]
+        return ApplicationResponse(
+            operation="runs.list",
+            status="ok",
+            result="ok",
+            session_id=session_id,
+            data={"session_id": session_id, "runs": runs},
+        )
+
     def run_status(self, run_id: str) -> ApplicationResponse:
         self._ensure_open()
         row = self.control.run(run_id)
