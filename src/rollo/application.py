@@ -1043,7 +1043,6 @@ class Application:
         session_id: str,
         prompt: str,
         command_id: str | None = None,
-        params_digest_value: str | None = None,
         run_id: str | None = None,
         parent_run_id: str | None = None,
         decision_generation: int = 0,
@@ -1058,13 +1057,6 @@ class Application:
             )
         command_id = command_id or f"cmd-{uuid.uuid4().hex}"
         requested_run_id = run_id
-        computed_digest = full_sha256({"session_id": session_id, "prompt": prompt})
-        if params_digest_value is not None and params_digest_value != computed_digest:
-            return ApplicationResponse(
-                "run.start", "rejected", "error", command_id=command_id,
-                session_id=session_id, error_code="digest_conflict",
-                data={"expected_params_digest": computed_digest},
-            )
         prompt_digest = full_sha256({"prompt": prompt})
         run_id = requested_run_id or f"run-{uuid.uuid4().hex}"
         # 1. Command-level idempotency: a retry of a committed command returns
@@ -1357,17 +1349,13 @@ class Application:
     def _stored_run_response(row: sqlite3.Row, *, command_id: str, prompt_digest: str) -> ApplicationResponse:
         """Return the committed reply for an already-committed command.
 
-        A replay whose parameters no longer match the committed row is refused
-        rather than answered with the first run's result.
+        The command identity is the idempotency key, so a replay returns the
+        first reply even if the prompt text differs: v3 dropped the v2 rule that
+        treated a differing parameter digest as a conflict, which is why there is
+        no second command ledger to compare against.  ``prompt_digest`` is kept
+        on the row as a diagnostic only.
         """
 
-        stored_digest = row["prompt_digest"]
-        if stored_digest is not None and str(stored_digest) != prompt_digest:
-            return ApplicationResponse(
-                "run.start", "rejected", "error",
-                command_id=command_id, session_id=row["session_id"], run_id=row["run_id"],
-                error_code="digest_conflict",
-            )
         stored = _response_from_json(row["response_json"])
         if stored is not None:
             return stored
