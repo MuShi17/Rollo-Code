@@ -528,33 +528,17 @@ class ControlStore:
                 session_id TEXT PRIMARY KEY,
                 workspace_id TEXT NOT NULL,
                 canonical_path TEXT NOT NULL,
+                create_command_id TEXT,
                 created_at TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'active'
             );
             CREATE INDEX IF NOT EXISTS idx_sessions_workspace ON sessions(workspace_id, created_at);
-            CREATE TABLE IF NOT EXISTS commands (
-                scope_type TEXT NOT NULL,
-                scope_id TEXT NOT NULL,
-                command_id TEXT NOT NULL,
-                operation TEXT NOT NULL,
-                params_digest TEXT NOT NULL,
-                session_id TEXT,
-                run_id TEXT,
-                request_id TEXT,
-                status TEXT NOT NULL,
-                error_code TEXT,
-                response_json TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                PRIMARY KEY(scope_type, scope_id, command_id)
-            );
-            CREATE INDEX IF NOT EXISTS idx_commands_run ON commands(run_id, updated_at);
             CREATE TABLE IF NOT EXISTS runs (
                 run_id TEXT PRIMARY KEY,
                 session_id TEXT NOT NULL,
                 workspace_id TEXT NOT NULL,
                 command_id TEXT NOT NULL,
-                owner_id TEXT,
+                owner_pid INTEGER NOT NULL DEFAULT 0,
                 parent_run_id TEXT,
                 decision_generation INTEGER NOT NULL DEFAULT 0,
                 status TEXT NOT NULL,
@@ -562,27 +546,21 @@ class ControlStore:
                 prompt_digest TEXT,
                 canonical_correlation_json TEXT NOT NULL DEFAULT '{}',
                 result_json TEXT,
+                response_json TEXT,
                 dispatch_intent INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 UNIQUE(session_id, command_id)
             );
             CREATE INDEX IF NOT EXISTS idx_runs_session ON runs(session_id, created_at);
-            CREATE TABLE IF NOT EXISTS owners (
-                owner_id TEXT PRIMARY KEY,
+            CREATE TABLE IF NOT EXISTS session_leases (
+                session_id TEXT PRIMARY KEY,
                 workspace_id TEXT NOT NULL,
-                root_owner_id TEXT NOT NULL,
-                parent_owner_id TEXT,
-                generation INTEGER NOT NULL,
-                process_id INTEGER NOT NULL,
-                lock_key TEXT NOT NULL,
-                status TEXT NOT NULL,
-                quarantine INTEGER NOT NULL DEFAULT 0,
-                evidence_json TEXT NOT NULL DEFAULT '{}',
-                created_at TEXT NOT NULL,
+                owner_id TEXT NOT NULL,
+                pid INTEGER NOT NULL,
+                acquired_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_owners_workspace ON owners(workspace_id, status, quarantine);
             CREATE TABLE IF NOT EXISTS pending_interactions (
                 request_id TEXT PRIMARY KEY,
                 workspace_id TEXT NOT NULL,
@@ -595,6 +573,7 @@ class ControlStore:
                 plan_digest TEXT,
                 metadata_json TEXT,
                 params_digest TEXT NOT NULL,
+                command_id TEXT,
                 prompt TEXT NOT NULL DEFAULT '',
                 expires_at TEXT,
                 process_id INTEGER NOT NULL,
@@ -615,27 +594,25 @@ class ControlStore:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS tool_operations (
-                operation_id TEXT PRIMARY KEY,
-                run_id TEXT NOT NULL,
-                invocation_id TEXT,
-                turn_id TEXT,
-                provider_tool_call_id TEXT NOT NULL,
-                tool_name TEXT NOT NULL,
-                canonical_args_hash TEXT NOT NULL,
-                state TEXT NOT NULL,
-                UNIQUE(run_id, provider_tool_call_id)
-            );
             """
         )
-        columns = {str(row["name"]) for row in self.connection.execute("PRAGMA table_info(tool_operations)").fetchall()}
-        if "invocation_id" not in columns:
-            self.connection.execute("ALTER TABLE tool_operations ADD COLUMN invocation_id TEXT")
-        if "turn_id" not in columns:
-            self.connection.execute("ALTER TABLE tool_operations ADD COLUMN turn_id TEXT")
+        # Additive, in-place migration for control databases written by the v2
+        # owner/command-ledger layout.  The legacy ``owners``/``commands``/
+        # ``tool_operations`` tables are left untouched but are no longer read:
+        # runs already carry the facts they duplicated.
+        columns = {str(row["name"]) for row in self.connection.execute("PRAGMA table_info(runs)").fetchall()}
+        if "owner_pid" not in columns:
+            self.connection.execute("ALTER TABLE runs ADD COLUMN owner_pid INTEGER NOT NULL DEFAULT 0")
+        if "response_json" not in columns:
+            self.connection.execute("ALTER TABLE runs ADD COLUMN response_json TEXT")
+        session_columns = {str(row["name"]) for row in self.connection.execute("PRAGMA table_info(sessions)").fetchall()}
+        if "create_command_id" not in session_columns:
+            self.connection.execute("ALTER TABLE sessions ADD COLUMN create_command_id TEXT")
         pending_columns = {str(row["name"]) for row in self.connection.execute("PRAGMA table_info(pending_interactions)").fetchall()}
         if "metadata_json" not in pending_columns:
             self.connection.execute("ALTER TABLE pending_interactions ADD COLUMN metadata_json TEXT")
+        if "command_id" not in pending_columns:
+            self.connection.execute("ALTER TABLE pending_interactions ADD COLUMN command_id TEXT")
         self.connection.execute(f"PRAGMA user_version = {self.schema_version}")
         self.connection.execute(
             "INSERT OR REPLACE INTO control_meta(key,value) VALUES('schema_version',?)",
