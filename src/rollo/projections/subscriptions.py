@@ -180,12 +180,22 @@ class GuiCursor:
         return dict(self.partial_versions).get(stream_key)
 
     def to_dict(self) -> dict[str, Any]:
+        """The cursor as a client must be able to hand it back.
+
+        ``service_epoch`` is part of the cursor's identity and the resume path
+        validates it, so a token that omits it can never be resumed: the service
+        would compare an empty epoch against its own and report the buffer as
+        invalid.  A transport that mirrors this dict verbatim is therefore
+        resumable; one that drops a field is not.
+        """
+
         return {
             "subscription_id": self.subscription_id,
             "session_id": self.session_id,
             "high_water": self.high_water,
             "projection_version": self.projection_version,
             "partial_versions": dict(self.partial_versions),
+            "service_epoch": self.service_epoch,
         }
 
 
@@ -567,7 +577,10 @@ class SubscriptionService:
         """Stop consuming status for one subscription and keep it resumable.
 
         ``GuiStream.aclose()`` routes here so the cancellation of the pump task
-        happens under the service lock.
+        happens under the service lock.  This is the counterpart of
+        :meth:`unsubscribe`: detaching keeps the buffer (and therefore the
+        cursor) valid, closing does not, so a transport that exposes only
+        ``unsubscribe`` cannot offer resumption at all.
         """
 
         async with self._lock:
