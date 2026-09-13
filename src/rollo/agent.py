@@ -3125,7 +3125,6 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                                 # ★ 发射 first_token 事件
                                 await self._emit("first_token", {"is_thinking": True})
                             self._out_thinking(thinking)
-                            self._emit_text(thinking)
                             if self._runtime_recorder:
                                 self._runtime_recorder.partial_text(thinking, kind="thinking")
                         elif hasattr(delta, 'partial_json'):
@@ -3542,7 +3541,6 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                         self._emit_text("\n")
                         await self._emit("first_token", {"is_thinking": True})
                     self._out_thinking(rc)
-                    self._emit_text(rc)
                     if self._runtime_recorder:
                         self._runtime_recorder.partial_text(rc, kind="thinking")
                     reasoning_content += rc

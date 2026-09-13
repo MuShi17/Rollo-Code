@@ -2,6 +2,8 @@ node_modules/
 dist/
 .env
 __pycache__/
+*.egg-info/
 .worktrees/
 benchmark_runs/
 .review3/
+

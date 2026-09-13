@@ -390,7 +390,35 @@ def _entry_workspace() -> Path:
         ) from exc
 
 
+def _configure_stdio_encoding() -> None:
+    """把**交互式控制台**的 stdout/stderr 固定为 UTF-8。
+
+    简体中文 Windows 的控制台默认码页是 936，Python 据此把 ``sys.stdout``
+    判定为 gbk。spinner 的 Braille 帧（``ui.SPINNER_FRAMES``）与中文都无法
+    用 gbk 编码，于是 spinner 线程抛 ``UnicodeEncodeError`` 死掉，中文输出也
+    变成乱码。
+
+    注意：控制台曾出现的 token 级重复（``LetLet me me``）与此无关，那是
+    ``agent.py`` 里思考文本同时走两条输出路径所致，已单独修复。
+
+    只对 TTY 生效。管道与重定向必须保持原编码：调用方（``subprocess.run``
+    的 ``text=True``、shell 重定向、CI 捕获）按**自己的 locale** 解码，若这里
+    单方面改成 UTF-8，父进程会以 gbk 解码 UTF-8 字节并抛
+    ``UnicodeDecodeError``，把输出直接变成 ``None``。
+    """
+
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if not stream.isatty():
+                continue
+            stream.reconfigure(encoding="utf-8")
+        except (AttributeError, OSError, ValueError):
+            # 不支持 reconfigure 的替身、已关闭或已分离的流：保持原状。
+            pass
+
+
 def main() -> None:
+    _configure_stdio_encoding()
     args = parse_args()
 
     # 入口一次性解析 workspace 上下文（D7：未指定时使用进程当前目录）。
