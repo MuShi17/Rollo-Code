@@ -5,4 +5,3 @@ __pycache__/
 .worktrees/
 benchmark_runs/
 .review3/
-docs/
