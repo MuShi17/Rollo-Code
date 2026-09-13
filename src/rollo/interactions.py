@@ -99,6 +99,8 @@ class InteractionRequest:
     tool_input: Any = None
     plan_id: str | None = None
     plan_digest: str | None = None
+    #: 应答该请求的宿主命令 id（C03 控制面用于 interaction.respond 幂等）。
+    command_id: str | None = None
     expires_at: float | str | None = None
     expires_at_utc: str | None = None
     metadata: Mapping[str, Any] | None = None

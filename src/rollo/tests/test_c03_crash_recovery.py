@@ -12,6 +12,7 @@ re-implementation of an Application branch.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import subprocess
@@ -53,6 +54,15 @@ class _RecordingAgent:
             marker_dir = Path(os.environ["C03_MARKER_DIR"])
             with (marker_dir / "side-effect.txt").open("a", encoding="utf-8") as stream:
                 stream.write("side-effect\n")
+        if prompt == "hold":
+            # Hold a live run (and therefore its session lease) until the test
+            # releases it, so a second process can observe the refusal.
+            release = Path(os.environ["C03_RELEASE_FILE"])
+            deadline = time.monotonic() + 120
+            while not release.exists():
+                if time.monotonic() > deadline:
+                    return
+                await asyncio.sleep(0.02)
 
     def abort(self) -> None:
         return None
@@ -177,7 +187,7 @@ def _worker_recover() -> None:
 
     import asyncio
 
-    from rollo.application import Application
+    from rollo.application import Application, _process_alive
 
     factory_calls: list[str] = []
 
@@ -209,15 +219,20 @@ def _worker_recover() -> None:
             }
             for row in app.control.runs_for_session(session_id)
         ]
-        payload["owners"] = [
+        # v3 evidence: the crashed holder left a lease row behind, it is stale
+        # (its process is gone), and the recovery scan took nothing over - it
+        # only classified the run.
+        lease = app.control.session_lease(session_id)
+        payload["lease"] = (
             {
-                "owner_id": row["owner_id"],
-                "status": row["status"],
-                "quarantine": int(row["quarantine"]),
-                "generation": int(row["generation"]),
+                "owner_id": lease["owner_id"],
+                "pid": int(lease["pid"]),
+                "pid_alive": _process_alive(int(lease["pid"])),
             }
-            for row in app.control.owner_rows(context.workspace_id)
-        ]
+            if lease is not None
+            else None
+        )
+        payload["lease_held_by_recovery_process"] = app._own_session(session_id)
         payload["agent_factory_calls"] = len(factory_calls)
         _emit(payload)
         await app.shutdown()
@@ -259,8 +274,8 @@ def _worker_retry_same_command() -> None:
     asyncio.run(main())
 
 
-def _worker_quarantine_then_reconcile() -> None:
-    """A crashed root frees the OS lock but must not silently hand over the workspace."""
+def _worker_reclaim_after_crash() -> None:
+    """A crashed session is immediately reusable; there is no reconcile step."""
 
     import asyncio
 
@@ -275,97 +290,124 @@ def _worker_quarantine_then_reconcile() -> None:
     async def main() -> None:
         context = _context(Path(os.environ["C03_ROOT"]))
         app = Application(context, agent_factory=factory)
-        payload: dict[str, Any] = {"scenario": "quarantine-then-reconcile"}
+        payload: dict[str, Any] = {"scenario": "reclaim-after-crash"}
+        session_id = os.environ["C03_SESSION_ID"]
+        try:
+            lease = app.control.session_lease(session_id)
+            assert lease is not None, "the crashed holder's lease must still be readable"
+            payload["lease_owner_id"] = lease["owner_id"]
+            payload["lease_pid"] = int(lease["pid"])
+            payload["factory_calls_before"] = len(factory_calls)
 
-        # The restarting root must observe the quarantined dead owner and refuse
-        # to acquire the workspace until that owner is explicitly reconciled.
-        row = app.control.owner(os.environ["C03_OWNER_ID"])
-        assert row is not None, "the crashed owner row must still be readable"
-        payload["owner_status"] = row["status"]
-        payload["owner_quarantine"] = int(row["quarantine"])
-
-        blocked = await app.run_start(
-            session_id=os.environ["C03_SESSION_ID"], prompt="adopt", command_id="adopt-command"
-        )
-        payload["blocked_status"] = blocked.status
-        payload["blocked_error_code"] = blocked.error_code
-        payload["factory_calls_before_quarantine_clear"] = len(factory_calls)
-
-        reconciled = app.owner_reconcile(
-            owner_id=os.environ["C03_OWNER_ID"],
-            generation=int(row["generation"]),
-            action="release",
-            evidence={"reason": "operator-verified-crash"},
-        )
-        payload["reconcile_status"] = reconciled.status
-        payload["reconcile_error_code"] = reconciled.error_code
-
-        accepted = await app.run_start(
-            session_id=os.environ["C03_SESSION_ID"],
-            prompt="side-effect",
-            command_id="after-reconcile-command",
-        )
-        payload["accepted_status"] = accepted.status
-        payload["accepted_error_code"] = accepted.error_code
-        if accepted.run_id is not None:
-            await app.wait_run(accepted.run_id)
-            payload["final_status"] = app.run_status(accepted.run_id).status
-        payload["factory_calls"] = len(factory_calls)
-        _emit(payload)
-        await app.shutdown()
+            # No operator action: the stale lease of a dead process is adopted.
+            accepted = await app.run_start(
+                session_id=session_id,
+                prompt="side-effect",
+                command_id="after-crash-command",
+            )
+            payload["accepted_status"] = accepted.status
+            payload["accepted_error_code"] = accepted.error_code
+            if accepted.run_id is not None:
+                await app.wait_run(accepted.run_id)
+                payload["final_status"] = app.run_status(accepted.run_id).status
+            payload["lease_released"] = app.control.session_lease(session_id) is None
+            payload["factory_calls"] = len(factory_calls)
+        finally:
+            _emit(payload)
+            await app.shutdown()
 
     asyncio.run(main())
 
 
-def _worker_lock_hold() -> None:
-    from rollo.workspace_lock import WorkspaceLock
+def _worker_session_hold() -> None:
+    """Hold one session's lease with a live run until the release flag appears."""
 
-    lock = WorkspaceLock(
-        Path(os.environ["C03_LOCK_PATH"]),
-        workspace_id=os.environ["C03_WORKSPACE_ID"],
-        owner_id="holder",
-    )
-    with lock:
-        _write_file(os.environ["C03_READY_FILE"], lock.key)
-        deadline = time.monotonic() + 60
-        while not Path(os.environ["C03_RELEASE_FILE"]).exists():
-            if time.monotonic() > deadline:
-                _emit({"scenario": "lock-hold", "held": True, "released": False})
-                return
-            time.sleep(0.02)
-    _emit({"scenario": "lock-hold", "held": True, "released": True, "key": lock.key})
+    import asyncio
+
+    from rollo.application import Application
+
+    async def main() -> None:
+        context = _context(Path(os.environ["C03_ROOT"]))
+        app = Application(context, agent_factory=_RecordingAgent)
+        try:
+            session = app.session_create("lease-holder").session_id
+            response = await app.run_start(
+                session_id=session, prompt="hold", command_id="holder-command"
+            )
+            _write_file(os.environ["C03_READY_FILE"], session)
+            _emit({
+                "scenario": "session-hold",
+                "session_id": session,
+                "run_id": response.run_id,
+                "status": response.status,
+                "error_code": response.error_code,
+                "pid": os.getpid(),
+            })
+            await app.wait_run(response.run_id)
+            _emit({
+                "scenario": "session-hold",
+                "released": True,
+                "run_id": response.run_id,
+                "status": app.run_status(response.run_id).status,
+            })
+        finally:
+            await app.shutdown()
+
+    asyncio.run(main())
 
 
-def _worker_lock_probe() -> None:
-    from rollo.workspace_lock import WorkspaceLock, WorkspaceLockBusyError, workspace_lock_key
+def _worker_session_probe() -> None:
+    """Ask the same workspace for the held session and for a fresh one."""
 
-    workspace_id = os.environ["C03_WORKSPACE_ID"]
-    lock = WorkspaceLock(
-        Path(os.environ["C03_LOCK_PATH"]), workspace_id=workspace_id, owner_id="probe"
-    )
-    payload: dict[str, Any] = {
-        "scenario": "lock-probe",
-        "key": workspace_lock_key(workspace_id),
-        "sibling_key": workspace_lock_key(os.environ.get("C03_SIBLING_WORKSPACE", "workspace-b")),
-    }
-    try:
-        lock.acquire()
-    except WorkspaceLockBusyError:
-        payload["acquired"] = False
-        payload["code"] = WorkspaceLockBusyError.code
-    else:
-        payload["acquired"] = True
-        lock.release()
-    _emit(payload)
+    import asyncio
+
+    from rollo.application import Application
+
+    factory_calls: list[str] = []
+
+    def factory(**kwargs: Any) -> Any:
+        factory_calls.append("created")
+        return _RecordingAgent(**kwargs)
+
+    async def main() -> None:
+        context = _context(Path(os.environ["C03_ROOT"]))
+        app = Application(context, agent_factory=factory)
+        payload: dict[str, Any] = {"scenario": "session-probe"}
+        try:
+            busy = await app.run_start(
+                session_id=os.environ["C03_SESSION_ID"],
+                prompt="side-effect",
+                command_id="probe-busy-command",
+            )
+            payload["busy_status"] = busy.status
+            payload["busy_error_code"] = busy.error_code
+            payload["busy_holder"] = (busy.data or {}).get("holder_owner_id")
+
+            other = await app.run_start(
+                session_id=os.environ["C03_OTHER_SESSION"],
+                prompt="side-effect",
+                command_id="probe-other-command",
+            )
+            payload["other_status"] = other.status
+            payload["other_error_code"] = other.error_code
+            if other.run_id is not None:
+                await app.wait_run(other.run_id)
+                payload["other_final_status"] = app.run_status(other.run_id).status
+        finally:
+            payload["factory_calls"] = len(factory_calls)
+            _emit(payload)
+            await app.shutdown()
+
+    asyncio.run(main())
 
 
 _WORKERS = {
     "run-start-then-crash": _worker_run_start_then_crash,
     "recover": _worker_recover,
     "retry-same-command": _worker_retry_same_command,
-    "quarantine-then-reconcile": _worker_quarantine_then_reconcile,
-    "lock-hold": _worker_lock_hold,
-    "lock-probe": _worker_lock_probe,
+    "reclaim-after-crash": _worker_reclaim_after_crash,
+    "session-hold": _worker_session_hold,
+    "session-probe": _worker_session_probe,
 }
 
 
@@ -461,31 +503,13 @@ def _crash_worker(tmp_path: Path, prompt: str = "crash-after-open") -> tuple[dic
     return handshake, stderr
 
 
-def _crashed_owner_id(tmp_path: Path) -> str:
-    """Read the single owner row straight from the durable control store."""
-
-    from rollo.application import ControlStore
-    from rollo.project_context import ProjectContext
-
-    context = ProjectContext.from_root(tmp_path, runtime_data_dir=tmp_path / "runtime")
-    store = ControlStore(
-        context.runtime_data_dir / "application" / context.workspace_id / "control.sqlite"
-    )
-    try:
-        rows = store.owner_rows(context.workspace_id)
-        assert len(rows) == 1, f"expected exactly one owner row, found {len(rows)}"
-        return str(rows[0]["owner_id"])
-    finally:
-        store.close()
-
-
 @pytest.mark.timeout(240)
 def test_restart_after_open_without_terminal_never_reports_success(tmp_path: Path):
     """Crash barrier #2/#3 — canonical evidence exists, no terminal was committed.
 
     The restarting Application must read the canonical ledger, refuse to report
-    success, quarantine the dead owner and never construct another agent.  The
-    expected classification is the D14 row for "terminal not observed"
+    success, classify the dead process' run and never construct another agent.
+    The expected classification is the D14 row for "terminal not observed"
     (``interrupted`` / ``run_dispatch_not_observed``); the invocation identity is
     still recovered into the correlation block.
     """
@@ -515,7 +539,11 @@ def test_restart_after_open_without_terminal_never_reports_success(tmp_path: Pat
         "tool_operations": [],
     }
     assert payload["agent_factory_calls"] == 0
-    assert any(item["quarantine"] == 1 for item in payload["owners"])
+    # The crashed holder's lease is stale evidence: its process is gone and the
+    # recovery scan classified the run without taking the session over.
+    assert payload["lease"] is not None
+    assert payload["lease"]["pid_alive"] is False, payload["lease"]
+    assert payload["lease_held_by_recovery_process"] is False
     # Exactly one agent was ever constructed: the crashed one.  A second marker
     # would prove the restart replayed the dispatch.
     assert len(_markers(tmp_path, "agent-*")) == 1
@@ -555,7 +583,9 @@ def test_restart_after_unpaired_tool_dispatch_is_uncertain_and_never_replayed(tm
         }
     ]
     assert payload["agent_factory_calls"] == 0
-    assert any(item["quarantine"] == 1 for item in payload["owners"])
+    assert payload["lease"] is not None
+    assert payload["lease"]["pid_alive"] is False, payload["lease"]
+    assert payload["lease_held_by_recovery_process"] is False
     assert len(_markers(tmp_path, "agent-*")) == 1
 
 
@@ -587,80 +617,85 @@ def test_retry_of_accepted_command_converges_without_second_dispatch(tmp_path: P
 
 
 @pytest.mark.timeout(240)
-def test_crashed_root_releases_os_lock_but_quarantine_refuses_new_root(tmp_path: Path):
-    """tasks 2.8 / 6.3 — physical lock release is not logical ownership release."""
+def test_crashed_session_is_reclaimed_without_reconcile(tmp_path: Path):
+    """v3: a crash blocks nothing — no quarantine, no manual reconcile.
+
+    The second process finds the dead holder's lease row, adopts it in the same
+    ``run.start`` and runs its own command instead of replaying the crashed one.
+    """
 
     handshake, _ = _crash_worker(tmp_path, "crash-after-dispatch")
-    owner_id = _crashed_owner_id(tmp_path)
 
     recovery = _spawn(
         tmp_path,
-        "quarantine-then-reconcile",
+        "reclaim-after-crash",
         C03_SESSION_ID=handshake["session_id"],
-        C03_OWNER_ID=owner_id,
     )
     exit_code, recovered, stderr = _collect(recovery)
     assert exit_code == 0, stderr
-    payload = next(item for item in recovered if item["scenario"] == "quarantine-then-reconcile")
+    payload = next(item for item in recovered if item["scenario"] == "reclaim-after-crash")
 
-    assert payload["blocked_status"] == "rejected"
-    assert payload["blocked_error_code"] == "owner_quarantine"
-    assert payload["factory_calls_before_quarantine_clear"] == 0
-    assert payload["owner_quarantine"] == 1
-    assert payload["reconcile_status"] == "released"
-    assert payload["reconcile_error_code"] is None
-    assert payload["accepted_status"] == "queued"
-    assert payload["accepted_error_code"] is None
-    assert payload["final_status"] == "succeeded"
-    assert payload["factory_calls"] == 1
-    # Explicit reconcile is the only path to a new root, and the new root runs
-    # its own command instead of replaying the crashed one.
+    # The stale lease is visible (evidence) but not a gate: its recorded pid is
+    # the crashed holder's, which is exactly what makes it adoptable.
+    assert payload["lease_owner_id"], payload
+    assert payload["lease_pid"] == handshake["pid"], payload
+    assert payload["factory_calls_before"] == 0
+    assert payload["accepted_status"] == "queued", payload
+    assert payload["accepted_error_code"] is None, payload
+    assert payload["final_status"] == "succeeded", payload
+    assert payload["factory_calls"] == 1, payload
+    assert payload["lease_released"] is True, payload
+    # The new process ran its own command exactly once; the crashed dispatch was
+    # never replayed.
     assert (tmp_path / "markers" / "side-effect.txt").read_text(encoding="utf-8").splitlines() == [
         "side-effect"
     ]
 
 
-@pytest.mark.timeout(180)
-def test_cross_process_workspace_lock_is_mutually_exclusive(tmp_path: Path):
-    """tasks 3.1 / 6.3 — a second process must observe a busy owner."""
+@pytest.mark.timeout(240)
+def test_cross_process_session_lease_blocks_only_that_session(tmp_path: Path):
+    """v3: the only execution mutex is the session lease.
 
-    lock_path = tmp_path / "locks" / "workspace.lock"
+    Two real processes on one workspace: the second is refused with
+    ``session_busy`` for the session the first one holds and is accepted for a
+    different session of that same workspace (workspace-level exclusion no
+    longer exists).
+    """
+
     ready = tmp_path / "ready.flag"
-    hold = _spawn(
-        tmp_path, "lock-hold", C03_LOCK_PATH=str(lock_path), C03_WORKSPACE_ID="workspace-a"
-    )
+    holder = _spawn(tmp_path, "session-hold")
     try:
-        assert _wait_for(ready.exists), "holder never reported the acquired lock"
-        holder_key = ready.read_text(encoding="utf-8")
+        assert _wait_for(ready.exists), "holder never acquired its session lease"
+        held_session = ready.read_text(encoding="utf-8").strip()
+        assert held_session, "holder never reported its session id"
 
         probe = _spawn(
             tmp_path,
-            "lock-probe",
-            C03_LOCK_PATH=str(lock_path),
-            C03_WORKSPACE_ID="workspace-a",
-            C03_SIBLING_WORKSPACE="workspace-b",
+            "session-probe",
+            C03_SESSION_ID=held_session,
+            C03_OTHER_SESSION="probe-other-session",
         )
         exit_code, probed, stderr = _collect(probe)
         assert exit_code == 0, stderr
-        payload = next(item for item in probed if item["scenario"] == "lock-probe")
-        assert payload["acquired"] is False
-        assert payload["code"] == "owner_conflict"
-        assert payload["key"] == holder_key, "the lock key must be recomputable cross-process"
-        assert payload["sibling_key"] != holder_key, "distinct workspaces must not share a key"
+        payload = next(item for item in probed if item["scenario"] == "session-probe")
+
+        assert payload["busy_status"] == "rejected", payload
+        assert payload["busy_error_code"] == "session_busy", payload
+        assert payload["busy_holder"], payload
+        assert payload["other_status"] == "queued", payload
+        assert payload["other_error_code"] is None, payload
+        assert payload["other_final_status"] == "succeeded", payload
+        assert payload["factory_calls"] == 1, payload
+        # Only the accepted session produced a side effect.
+        assert (tmp_path / "markers" / "side-effect.txt").read_text(encoding="utf-8").splitlines() == [
+            "side-effect"
+        ]
     finally:
         (tmp_path / "release.flag").write_text("release", encoding="utf-8")
 
-    exit_code, held, stderr = _collect(hold)
+    exit_code, held, stderr = _collect(holder)
     assert exit_code == 0, stderr
     assert any(item.get("released") for item in held), f"holder output: {held!r} {stderr!r}"
-
-    after = _spawn(
-        tmp_path, "lock-probe", C03_LOCK_PATH=str(lock_path), C03_WORKSPACE_ID="workspace-a"
-    )
-    exit_code, probed, stderr = _collect(after)
-    assert exit_code == 0, stderr
-    final = next(item for item in probed if item["scenario"] == "lock-probe")
-    assert final["acquired"] is True, "a released lock must be acquirable again"
 
 
 if __name__ == "__main__":  # pragma: no cover - worker entry point

@@ -119,30 +119,55 @@ def test_cross_application_cancel_is_observed_before_success(tmp_path: Path):
     asyncio.run(scenario())
 
 
-def test_foreign_owner_cannot_release_live_capability(tmp_path: Path):
+def _seed_session_lease(app: Application, session_id: str, *, owner_id: str, pid: int) -> None:
+    """Seed the durable state of "another live process holds this session"."""
+
+    now = "2026-01-01T00:00:00.000Z"
+    with app.control.transaction() as db:
+        db.execute(
+            "INSERT OR REPLACE INTO session_leases(session_id,workspace_id,owner_id,pid,acquired_at,updated_at) VALUES(?,?,?,?,?,?)",
+            (session_id, app.context.workspace_id, owner_id, pid, now, now),
+        )
+
+
+def test_run_start_rejects_a_session_held_by_a_live_process(tmp_path: Path):
+    """A second holder of a live session must be refused with ``session_busy``.
+
+    This is the only execution mutex in v3 and the error code is reachable only
+    through a real ``run_start``, so the test drives the public entry point with
+    a live foreign pid instead of calling ``ControlStore`` directly.
+    """
+
     async def scenario():
         context = _context(tmp_path)
-        _BlockingAgent.gate = asyncio.Event()
-        app1 = Application(context, agent_factory=_BlockingAgent)
-        session = app1.session_create("foreign-owner").session_id
-        started = await app1.run_start(session_id=session, prompt="block", command_id="foreign-owner-command")
-        await asyncio.sleep(0.02)
-        control_path = context.runtime_data_dir / "application" / context.workspace_id / "control.sqlite"
-        app2 = Application(context, agent_factory=_BlockingAgent, control_store=ControlStore(control_path))
-        row = app2.control.owner(app1.owner_id)
-        assert row is not None
-        response = app2.owner_reconcile(
-            owner_id=app1.owner_id,
-            generation=int(row["generation"]),
-            action="release",
-            evidence={"pid": row["process_id"], "reason": "not-authoritative"},
-        )
-        assert response.error_code == "owner_foreign_active"
-        assert app2.control.owner(app1.owner_id)["status"] == "active"
-        _BlockingAgent.gate.set()
-        await app1.wait_run(started.run_id)
-        await app2.shutdown()
-        await app1.shutdown()
+        holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+        try:
+            def factory(**kwargs):
+                raise AssertionError("a rejected run.start must never construct an agent")
+
+            app = Application(context, agent_factory=factory)
+            try:
+                session = app.session_create("busy-session").session_id
+                _seed_session_lease(app, session, owner_id="owner-live-holder", pid=holder.pid)
+
+                response = await app.run_start(
+                    session_id=session, prompt="blocked", command_id="busy-command"
+                )
+
+                assert response.status == "rejected", response
+                assert response.error_code == "session_busy", response
+                assert response.data["session_id"] == session, response
+                assert response.data["holder_owner_id"] == "owner-live-holder", response
+                # The refusal happens before the dispatch barrier: no run row,
+                # no agent, and the lease still belongs to the live holder.
+                assert app.control.runs_for_session(session) == []
+                assert session not in app._session_leases
+                assert app.control.session_lease(session)["owner_id"] == "owner-live-holder"
+            finally:
+                await app.shutdown()
+        finally:
+            holder.kill()
+            holder.wait(timeout=30)
 
     asyncio.run(scenario())
 
@@ -172,7 +197,7 @@ def test_inspect_only_session_is_never_implicitly_adopted(tmp_path: Path):
     asyncio.run(scenario())
 
 
-def test_canonical_projection_records_tool_operation_in_control_ledger(tmp_path: Path):
+def test_canonical_projection_records_tool_operation_in_correlation(tmp_path: Path):
     async def scenario():
         context = _context(tmp_path)
         app = Application(context, agent_factory=_CanonicalAgent)
@@ -180,15 +205,16 @@ def test_canonical_projection_records_tool_operation_in_control_ledger(tmp_path:
         started = await app.run_start(session_id=session, prompt="canonical", command_id="tool-ledger-command")
         final = await app.wait_run(started.run_id)
         assert final.status == "succeeded"
+        # v3 removed the control-plane tool_operations ledger: the canonical
+        # correlation block is now the only tool-identity record.
         assert final.data["canonical_correlation"]["tool_operations"][0]["operation_id"] == "op-1"
-        assert len(app.control.tool_operations(started.run_id)) == 1
         assert final.data["result"]["completed"] is True
         await app.shutdown()
 
     asyncio.run(scenario())
 
 
-def test_shutdown_incomplete_retains_owner_until_run_finishes(tmp_path: Path):
+def test_shutdown_incomplete_retains_session_lease_until_run_finishes(tmp_path: Path):
     async def scenario():
         context = _context(tmp_path)
         _BlockingAgent.gate = asyncio.Event()
@@ -196,14 +222,28 @@ def test_shutdown_incomplete_retains_owner_until_run_finishes(tmp_path: Path):
         session = app.session_create("shutdown-retain").session_id
         started = await app.run_start(session_id=session, prompt="block", command_id="shutdown-retain-command")
         await asyncio.sleep(0.02)
-        owner_id = app.owner_id
+        assert app._own_session(session)
+        assert int(app.control.session_lease(session)["pid"]) == os.getpid()
         incomplete = await app.shutdown(timeout=0.001)
         assert incomplete.status == "shutdown_incomplete"
-        assert app.owner_id == owner_id
+        # An unfinished run must keep its session lease.
+        assert app._own_session(session)
+        assert app.control.session_lease(session) is not None
         _BlockingAgent.gate.set()
         await app.wait_run(started.run_id)
+        # The finished run releases its own lease before shutdown.
+        assert not app._own_session(session)
         complete = await app.shutdown(timeout=1)
         assert complete.status == "shutdown_complete"
+        # External oracle: the durable row is gone once the Application released
+        # it (the Application closed its own control handle with shutdown).
+        store = ControlStore(
+            context.runtime_data_dir / "application" / context.workspace_id / "control.sqlite"
+        )
+        try:
+            assert store.session_lease(session) is None
+        finally:
+            store.close()
 
     asyncio.run(scenario())
 
@@ -217,9 +257,11 @@ def test_restart_recovery_does_not_replay_dispatch_intent(tmp_path: Path):
         started = await app1.run_start(session_id=session, prompt="block", command_id="recovery-no-replay-command")
         await asyncio.sleep(0.02)
         control_path = context.runtime_data_dir / "application" / context.workspace_id / "control.sqlite"
-        owner_id = app1.owner_id
+        # Simulate "the process that owned this run is gone": the recovery scan
+        # skips rows owned by this (live) process, so repoint the attribution at
+        # a pid that no longer exists.
         with app1.control.transaction() as db:
-            db.execute("UPDATE owners SET process_id=? WHERE owner_id=?", (999999999, owner_id))
+            db.execute("UPDATE runs SET owner_pid=? WHERE run_id=?", (999999999, started.run_id))
         app2 = Application(context, agent_factory=lambda **kwargs: (_ for _ in ()).throw(AssertionError("must not replay")), control_store=ControlStore(control_path))
         status = app2.run_status(started.run_id)
         assert status.status == "interrupted"
@@ -268,6 +310,38 @@ def test_provider_only_multiple_turns_are_ambiguous():
 
     projection = project_canonical_evidence(events, session_id="s", run_id="r")
     assert projection.error_code == "canonical_identity_ambiguous"
+
+
+def test_sessions_of_one_workspace_run_in_parallel(tmp_path: Path):
+    """The unit of execution exclusion is the session, not the workspace.
+
+    A workspace-wide gate would refuse the desktop application's default
+    behaviour of holding several sessions open at once, so a live run in
+    session A must never block session B.
+    """
+
+    async def scenario():
+        context = _context(tmp_path)
+        _BlockingAgent.gate = asyncio.Event()
+        app = Application(context, agent_factory=_BlockingAgent)
+        session_a = app.session_create("parallel-a").session_id
+        session_b = app.session_create("parallel-b").session_id
+        blocking = await app.run_start(session_id=session_a, prompt="block", command_id="parallel-a-command")
+        await asyncio.sleep(0.02)
+        assert app.run_status(blocking.run_id).status in {"queued", "running"}
+
+        other = await app.run_start(session_id=session_b, prompt="plain", command_id="parallel-b-command")
+        assert other.error_code is None, other
+        assert other.status == "queued", other
+        assert (await app.wait_run(other.run_id)).status == "succeeded"
+
+        # Session A's run was neither refused nor disturbed by session B.
+        assert app.run_status(blocking.run_id).status in {"queued", "running"}
+        _BlockingAgent.gate.set()
+        assert (await app.wait_run(blocking.run_id)).status == "succeeded"
+        await app.shutdown()
+
+    asyncio.run(scenario())
 
 
 def test_cross_process_command_idempotency_has_one_run_and_one_side_effect(tmp_path: Path):

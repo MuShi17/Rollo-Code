@@ -2,10 +2,11 @@
 
 Two contract points are pinned here against the *real* CLI entry point:
 
-1. a quarantined workspace must not silently report success — the rejected
-   ``run.start`` never reaches the provider and the process exits non-zero;
+1. a session held by another live process must not silently report success — the
+   rejected ``run.start`` never reaches the provider and the process exits
+   non-zero;
 2. a successful one-shot must actually run *through* the Application control
-   plane, leaving a session/run/command identity in ``control.sqlite``.
+   plane, leaving session/run identity in ``control.sqlite``.
 
 Point 2 is what makes "wire the CLI back to a direct ``agent.chat``" fail: that
 regression is invisible to any provider-level assertion, which is exactly how it
@@ -28,32 +29,48 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 _SRC_ROOT = _REPO_ROOT / "src"
 
 
-def _seed_quarantined_workspace(root: Path) -> str:
-    """Create the durable state a real crashed root leaves behind."""
-
-    from rollo.application import ControlStore
+def _runtime_context(root: Path):
     from rollo.project_context import ProjectContext
 
-    context = ProjectContext.from_root(root, runtime_data_dir=root / "runtime")
-    store = ControlStore(
+    return ProjectContext.from_root(root, runtime_data_dir=root / "runtime")
+
+
+def _control_store(root: Path):
+    from rollo.application import ControlStore
+
+    context = _runtime_context(root)
+    return ControlStore(
         context.runtime_data_dir / "application" / context.workspace_id / "control.sqlite"
     )
+
+
+def _bootstrap_session(root: Path) -> str:
+    """Run one real one-shot so the CLI has a canonical session to resume."""
+
+    with _ProviderStub(root / "bootstrap-requests.json", reply=True) as stub:
+        result = _run_cli(root, f"http://127.0.0.1:{stub.port}", "--no-thinking", "bootstrap")
+    assert result.returncode == 0, result.stdout + result.stderr
+    session_dirs = sorted(
+        path.parent.name for path in (root / "runtime" / "sessions").glob("*/runtime.sqlite")
+    )
+    assert len(session_dirs) == 1, session_dirs
+    return session_dirs[0]
+
+
+def _seed_live_session_lease(root: Path, session_id: str, pid: int) -> None:
+    """Seed the durable state of "another live process holds this session"."""
+
+    context = _runtime_context(root)
+    store = _control_store(root)
+    now = "2026-01-01T00:00:00.000Z"
     try:
-        store.insert_owner(
-            owner_id="owner-crashed",
-            workspace_id=context.workspace_id,
-            generation=1,
-            lock_key="lock-key",
-        )
-        # A process that is certainly gone, so the dead-owner branch is
-        # reachable in any runner, regardless of process reaping order.
-        store.connection.execute(
-            "UPDATE owners SET process_id=?, status='active', quarantine=0 WHERE owner_id=?",
-            (999_999_999, "owner-crashed"),
-        )
+        with store.transaction() as db:
+            db.execute(
+                "INSERT OR REPLACE INTO session_leases(session_id,workspace_id,owner_id,pid,acquired_at,updated_at) VALUES(?,?,?,?,?,?)",
+                (session_id, context.workspace_id, "owner-live-holder", pid, now, now),
+            )
     finally:
         store.close()
-    return context.workspace_id
 
 
 def _sse_event(event_type: str, payload: dict) -> bytes:
@@ -176,52 +193,65 @@ def _run_cli(root: Path, base_url: str, *args: str) -> subprocess.CompletedProce
 
 
 @pytest.mark.timeout(300)
-def test_cli_reports_failure_instead_of_silently_succeeding_on_quarantine(tmp_path: Path):
-    _seed_quarantined_workspace(tmp_path)
+def test_cli_reports_failure_instead_of_silently_succeeding_on_a_busy_session(tmp_path: Path):
+    """v3: the session is the unit of exclusion, and the CLI must surface it."""
+
+    session_id = _bootstrap_session(tmp_path)
     request_log = tmp_path / "provider-requests.json"
+    # A process that is certainly alive, so the refusal comes from a real
+    # liveness check rather than from reaping order.
+    holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+    try:
+        _seed_live_session_lease(tmp_path, session_id, holder.pid)
+        with _ProviderStub(request_log, reply=True) as stub:
+            result = _run_cli(
+                tmp_path, f"http://127.0.0.1:{stub.port}", "--no-thinking", "--resume", "hello"
+            )
+            requests = list(stub.requests)
+    finally:
+        holder.kill()
+        holder.wait(timeout=30)
 
-    with _ProviderStub(request_log) as stub:
-        result = _run_cli(tmp_path, f"http://127.0.0.1:{stub.port}", "--no-thinking", "hello")
-        requests = list(stub.requests)
-
-    # Fact 1: the quarantined workspace must not reach the provider at all.
-    assert requests == [], f"a quarantined workspace dispatched a provider request: {requests!r}"
+    # Fact 1: the refused session must not reach the provider at all.
+    assert requests == [], f"a busy session dispatched a provider request: {requests!r}"
     # Fact 2: and the refusal must be visible to the caller.
     assert result.returncode != 0, (
-        "a quarantined workspace must not exit 0: "
+        "a busy session must not exit 0: "
         f"stdout={result.stdout!r} stderr={result.stderr!r}"
     )
     combined = result.stdout + result.stderr
-    assert "owner_quarantine" in combined, combined
+    assert "session_busy" in combined, combined
 
-    # The quarantine must survive an ordinary CLI attempt: a rejected run may
-    # not clear the very state that protects the crashed workspace.
-    from rollo.application import ControlStore
-    from rollo.project_context import ProjectContext
-
-    context = ProjectContext.from_root(tmp_path, runtime_data_dir=tmp_path / "runtime")
-    store = ControlStore(
-        context.runtime_data_dir / "application" / context.workspace_id / "control.sqlite"
-    )
+    # A rejected run may neither clear the holder's lease nor leave a run row.
+    store = _control_store(tmp_path)
     try:
-        row = store.owner("owner-crashed")
-        assert row is not None
-        assert int(row["quarantine"]) == 1
-        assert list(store.connection.execute("SELECT run_id FROM runs")) == []
+        lease = store.session_lease(session_id)
+        assert lease is not None, "the live holder's lease must survive the refusal"
+        assert lease["owner_id"] == "owner-live-holder", dict(lease)
+        assert int(lease["pid"]) == holder.pid, dict(lease)
+        runs = [dict(row) for row in store.runs_for_session(session_id)]
+        assert len(runs) == 1, runs  # only the bootstrap run
+        assert runs[0]["status"] == "succeeded", runs
     finally:
         store.close()
 
 
 @pytest.mark.timeout(300)
-def test_cli_read_only_inspection_still_works_in_a_quarantined_workspace(tmp_path: Path):
-    """Only new runs are blocked; inspection must stay available."""
+def test_cli_read_only_inspection_still_works_while_a_session_is_busy(tmp_path: Path):
+    """Only new runs are refused; inspection must stay available."""
 
-    _seed_quarantined_workspace(tmp_path)
-
-    with _ProviderStub(tmp_path / "provider-requests.json") as stub:
-        result = _run_cli(tmp_path, f"http://127.0.0.1:{stub.port}", "--list")
+    session_id = _bootstrap_session(tmp_path)
+    holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+    try:
+        _seed_live_session_lease(tmp_path, session_id, holder.pid)
+        with _ProviderStub(tmp_path / "provider-requests.json") as stub:
+            result = _run_cli(tmp_path, f"http://127.0.0.1:{stub.port}", "--list")
+    finally:
+        holder.kill()
+        holder.wait(timeout=30)
 
     assert result.returncode == 0, result.stdout + result.stderr
+    assert session_id in result.stdout, result.stdout
 
 
 def _run_cli_stdin(
@@ -328,24 +358,18 @@ def test_cli_one_shot_records_application_session_and_run_identity(tmp_path: Pat
         runs = [dict(row) for row in store.runs_for_session(session_id)]
         assert len(runs) == 1, runs
         # The CLI issues a per-invocation command id; the durable row proves the
-        # run went through the Application command envelope, not a bare chat().
+        # run went through the Application control plane, not a bare chat().
         assert runs[0]["command_id"].startswith(f"cli-{session_id}-"), runs
-        assert runs[0]["owner_id"], runs
+        # v3: the run row itself is the idempotency carrier.  It records which
+        # process ran it and stores the reply a retry converges on.
+        assert int(runs[0]["owner_pid"]) > 0, runs
+        assert runs[0]["prompt_digest"], runs
+        assert runs[0]["response_json"], runs
         # The run must actually *execute* inside the control plane and reach the
         # provider-backed terminal.  Asserting only "a run row exists" would pass
         # even if the CLI ran agent.chat() outside the Application, because
         # run.start would still have committed its bookkeeping row first.
         assert runs[0]["status"] == "succeeded", runs
         assert runs[0]["error_code"] is None, runs
-
-        commands = [
-            dict(row)
-            for row in store.connection.execute(
-                "SELECT * FROM commands WHERE command_id=?", (runs[0]["command_id"],)
-            )
-        ]
-        assert len(commands) == 1, commands
-        assert commands[0]["operation"] == "run.start"
-        assert commands[0]["params_digest"], commands
     finally:
         store.close()

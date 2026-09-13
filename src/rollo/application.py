@@ -1,9 +1,15 @@
 """The process-local Application control plane for C03.
 
 This module intentionally sits above the C02 canonical event store.  SQLite
-control rows provide command idempotency, ownership and recovery evidence;
-``Agent`` and ``SQLiteRuntimeStore`` continue to own provider-neutral runtime
-facts.  No public method consults Agent private lifecycle fields.
+control rows provide command idempotency, session exclusion and recovery
+evidence; ``Agent`` and ``SQLiteRuntimeStore`` continue to own provider-neutral
+runtime facts.  No public method consults Agent private lifecycle fields.
+
+Execution exclusion is per *session*, never per workspace: each session owns its
+own canonical store, so two sessions of one workspace share no write target.
+``session_leases`` is the only mutex, ``runs(session_id, command_id)`` is the
+command-level idempotency key, and ``runs.owner_pid`` is crash-recovery
+attribution only - never a gate.
 """
 
 from __future__ import annotations
@@ -12,7 +18,6 @@ import asyncio
 import contextlib
 import hashlib
 import json
-import math
 import os
 import sqlite3
 import time
@@ -32,7 +37,6 @@ from .project_context import ProjectContext, require_context
 from .runtime_ports import NullOutputPort, OutputPort
 from .runtime_store import SQLiteRuntimeStore
 from .session import runtime_store_path
-from .workspace_lock import WorkspaceLock, WorkspaceLockBusyError, workspace_lock_key
 
 __all__ = [
     "APPLICATION_SCHEMA_VERSION",
@@ -44,13 +48,10 @@ __all__ = [
     "CanonicalProjection",
     "project_canonical_evidence",
     "ApplicationError",
-    "CommandConflictError",
-    "OwnerConflictError",
     "InteractionBindingError",
     "RecoveryRequiredError",
     "ApplicationClosedError",
     "ApplicationResponse",
-    "CommandEnvelope",
     "ControlStore",
     "ApplicationInteractionPort",
     "Application",
@@ -64,92 +65,21 @@ def _utc_now() -> str:
 
 
 def canonical_json_bytes(value: Any) -> bytes:
-    """Canonical JSON v1 used by public Application digests.
+    """Canonical JSON used by public Application digests.
 
-    The runtime accepts only finite JSON values.  Sorting keys, preserving list
-    order and removing insignificant whitespace gives a stable byte stream for
-    the identity fields used by C03.  The implementation deliberately does not
-    use ``default=str``: silently stringifying an input would make approval
-    binding weaker.
+    Sorting keys, preserving list order and removing insignificant whitespace
+    gives a stable byte stream for the identity fields used by C03.  The
+    implementation deliberately does not use ``default=str``: silently
+    stringifying an input would make approval binding weaker.  ``allow_nan``
+    stays off for the same reason: the v2 implementation rejected non-finite
+    numbers outright, and emitting bare ``NaN``/``Infinity`` tokens would both
+    produce invalid JSON in the control records and let a non-finite value into
+    a digest that is supposed to be reproducible.
     """
 
-    return _jcs_encode(value).encode("utf-8")
-
-
-def _jcs_encode(value: Any) -> str:
-    """Encode the JSON data model using RFC 8785's compact ordering rules."""
-
-    if value is None:
-        return "null"
-    if value is True:
-        return "true"
-    if value is False:
-        return "false"
-    if isinstance(value, str):
-        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-    if isinstance(value, int) and not isinstance(value, bool):
-        # RFC 8785 is defined over ECMAScript Number values.  Refusing an
-        # integer outside the exact IEEE-754 safe range is preferable to
-        # silently emitting Python's arbitrary-precision spelling, which a
-        # JavaScript verifier would round to a different digest.
-        if abs(value) > 2**53 - 1:
-            raise ValueError("JCS integer exceeds the IEEE-754 safe range")
-        return str(value)
-    if isinstance(value, float):
-        return _jcs_float(value)
-    if isinstance(value, (list, tuple)):
-        return "[" + ",".join(_jcs_encode(item) for item in value) + "]"
-    if isinstance(value, Mapping):
-        if not all(isinstance(key, str) for key in value):
-            raise TypeError("JCS object keys must be strings")
-        # RFC 8785 sorts the UTF-16 code units, rather than Unicode scalar
-        # values (the distinction matters for supplementary-plane keys).
-        ordered = sorted(value.items(), key=lambda item: item[0].encode("utf-16-be", "surrogatepass"))
-        return "{" + ",".join(
-            json.dumps(key, ensure_ascii=False, separators=(",", ":")) + ":" + _jcs_encode(item)
-            for key, item in ordered
-        ) + "}"
-    raise TypeError(f"value is not JSON serializable for JCS: {type(value).__name__}")
-
-
-def _jcs_float(value: float) -> str:
-    if not math.isfinite(value):
-        raise ValueError("JCS does not permit NaN or Infinity")
-    if value == 0:
-        return "0"
-    raw = repr(value).lower()
-    sign = ""
-    if raw.startswith("-"):
-        sign, raw = "-", raw[1:]
-    if "e" in raw:
-        mantissa, exponent_text = raw.split("e", 1)
-        exponent = int(exponent_text)
-    else:
-        mantissa, exponent = raw, 0
-    if "." in mantissa:
-        whole, fraction = mantissa.split(".", 1)
-        digits = whole + fraction
-        decimal_position = len(whole) + exponent
-    else:
-        digits = mantissa
-        decimal_position = len(mantissa) + exponent
-    digits = digits.rstrip("0") or "0"
-    # repr() can contain a decimal zero only when the value itself is zero;
-    # for non-zero values stripping it preserves the shortest representation.
-    if decimal_position > 0 and decimal_position <= 21:
-        if decimal_position >= len(digits):
-            number = digits + "0" * (decimal_position - len(digits))
-        else:
-            number = digits[:decimal_position] + "." + digits[decimal_position:]
-    elif decimal_position <= 0 and decimal_position > -6:
-        number = "0." + "0" * (-decimal_position) + digits
-    else:
-        exponent_value = decimal_position - 1
-        number = digits[0]
-        if len(digits) > 1:
-            number += "." + digits[1:]
-        number += "e" + ("+" if exponent_value >= 0 else "") + str(exponent_value)
-    return sign + number
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+    ).encode("utf-8")
 
 
 def full_sha256(value: Any) -> str:
@@ -366,14 +296,6 @@ class ApplicationError(RuntimeError):
             self.code = code
 
 
-class CommandConflictError(ApplicationError):
-    code = "digest_conflict"
-
-
-class OwnerConflictError(ApplicationError):
-    code = "owner_conflict"
-
-
 class InteractionBindingError(ApplicationError):
     code = "interaction_binding_error"
 
@@ -384,40 +306,6 @@ class RecoveryRequiredError(ApplicationError):
 
 class ApplicationClosedError(ApplicationError):
     code = "application_closed"
-
-
-@dataclass(frozen=True, slots=True)
-class CommandEnvelope:
-    command_id: str
-    scope_type: str
-    scope_id: str
-    operation: str
-    params_digest: str
-    session_id: str | None = None
-    run_id: str | None = None
-    request_id: str | None = None
-    schema_version: int = APPLICATION_SCHEMA_VERSION
-    submitted_at: str = field(default_factory=_utc_now)
-
-    def __post_init__(self) -> None:
-        for name in ("command_id", "scope_type", "scope_id", "operation", "params_digest"):
-            value = getattr(self, name)
-            if not isinstance(value, str) or not value.strip():
-                raise ValueError(f"{name} must be a non-empty string")
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "command_id": self.command_id,
-            "scope_type": self.scope_type,
-            "scope_id": self.scope_id,
-            "operation": self.operation,
-            "params_digest": self.params_digest,
-            "session_id": self.session_id,
-            "run_id": self.run_id,
-            "request_id": self.request_id,
-            "schema_version": self.schema_version,
-            "submitted_at": self.submitted_at,
-        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -634,12 +522,6 @@ class ControlStore:
     def close(self) -> None:
         self.connection.close()
 
-    def get_command(self, envelope: CommandEnvelope) -> sqlite3.Row | None:
-        return self.connection.execute(
-            "SELECT * FROM commands WHERE scope_type=? AND scope_id=? AND command_id=?",
-            (envelope.scope_type, envelope.scope_id, envelope.command_id),
-        ).fetchone()
-
     def register_session(self, *, workspace_id: str, session_id: str, canonical_path: Path) -> None:
         now = _utc_now()
         with self.transaction() as db:
@@ -654,105 +536,112 @@ class ControlStore:
             (workspace_id,),
         ).fetchall()
 
-    def insert_owner(
-        self,
-        *,
-        owner_id: str,
-        workspace_id: str,
-        generation: int,
-        lock_key: str,
-        parent_owner_id: str | None = None,
-    ) -> None:
-        now = _utc_now()
-        with self.transaction() as db:
-            db.execute(
-                "INSERT INTO owners(owner_id,workspace_id,root_owner_id,parent_owner_id,generation,process_id,lock_key,status,quarantine,evidence_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                (owner_id, workspace_id, owner_id, parent_owner_id, generation, os.getpid(), lock_key, "active", 0, "{}", now, now),
-            )
+    def run_for_command(self, session_id: str, command_id: str) -> sqlite3.Row | None:
+        """Read the durable row that makes ``(session_id, command_id)`` idempotent."""
 
-    def owner_rows(self, workspace_id: str) -> list[sqlite3.Row]:
         return self.connection.execute(
-            "SELECT * FROM owners WHERE workspace_id=? ORDER BY created_at,owner_id",
-            (workspace_id,),
+            "SELECT * FROM runs WHERE session_id=? AND command_id=?",
+            (session_id, command_id),
+        ).fetchone()
+
+    def non_terminal_runs(self) -> list[sqlite3.Row]:
+        """Runs a crashed process may have left mid-flight (recovery input only)."""
+
+        return self.connection.execute(
+            "SELECT * FROM runs WHERE status IN ('queued','running','waiting_interaction','cancelling') "
+            "ORDER BY created_at,run_id",
         ).fetchall()
 
-    def owner(self, owner_id: str) -> sqlite3.Row | None:
-        return self.connection.execute("SELECT * FROM owners WHERE owner_id=?", (owner_id,)).fetchone()
+    def session_lease(self, session_id: str) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT * FROM session_leases WHERE session_id=?", (session_id,)
+        ).fetchone()
 
-    def update_owner(self, owner_id: str, **fields: Any) -> None:
-        allowed = {"status", "quarantine", "evidence_json", "updated_at", "generation"}
-        values = {key: value for key, value in fields.items() if key in allowed}
-        if not values:
-            return
-        values.setdefault("updated_at", _utc_now())
-        assignments = ",".join(f"{key}=?" for key in values)
-        with self.transaction() as db:
-            db.execute(
-                f"UPDATE owners SET {assignments} WHERE owner_id=?",
-                (*values.values(), owner_id),
-            )
+    def acquire_session_lease(self, *, session_id: str, workspace_id: str, owner_id: str) -> str | None:
+        """Take the session mutex; return the live holder's id when refused.
 
-    def insert_run_and_command(
-        self,
-        envelope: CommandEnvelope,
-        *,
-        run_id: str,
-        workspace_id: str,
-        owner_id: str,
-        prompt_digest: str,
-        parent_run_id: str | None,
-        decision_generation: int = 0,
-    ) -> ApplicationResponse:
-        now = _utc_now()
-        response = ApplicationResponse(
-            operation=envelope.operation,
-            status="queued",
-            result="accepted",
-            command_id=envelope.command_id,
-            session_id=envelope.session_id,
-            run_id=run_id,
-            data={"owner_id": owner_id, "dispatch_intent": False},
-        )
-        with self.transaction() as db:
-            existing = db.execute(
-                "SELECT * FROM commands WHERE scope_type=? AND scope_id=? AND command_id=?",
-                (envelope.scope_type, envelope.scope_id, envelope.command_id),
-            ).fetchone()
-            if existing is not None:
-                if existing["params_digest"] != envelope.params_digest:
-                    raise CommandConflictError("command_id 已被不同参数摘要使用")
-                stored = _response_from_json(existing["response_json"])
-                if stored is None:
-                    raise ApplicationError("accepted command has no response")
-                return stored
-            db.execute(
-                "INSERT INTO commands(scope_type,scope_id,command_id,operation,params_digest,session_id,run_id,status,error_code,response_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                (envelope.scope_type, envelope.scope_id, envelope.command_id, envelope.operation, envelope.params_digest, envelope.session_id, run_id, "accepted", None, _response_json(response), now, now),
-            )
-            db.execute(
-                "INSERT INTO runs(run_id,session_id,workspace_id,command_id,owner_id,parent_run_id,decision_generation,status,error_code,prompt_digest,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                (run_id, envelope.session_id, workspace_id, envelope.command_id, owner_id, parent_run_id, decision_generation, "queued", None, prompt_digest, now, now),
-            )
-        return response
-
-    def record_command(self, envelope: CommandEnvelope, response: ApplicationResponse, *, status: str = "accepted") -> ApplicationResponse:
-        """Persist a non-run command response under the same idempotency key."""
+        A lease whose recorded process is gone is stale evidence rather than a
+        lock, so the next process adopts it without operator help.  Only a lease
+        held by a *live* foreign process refuses.
+        """
 
         now = _utc_now()
         with self.transaction() as db:
             row = db.execute(
-                "SELECT * FROM commands WHERE scope_type=? AND scope_id=? AND command_id=?",
-                (envelope.scope_type, envelope.scope_id, envelope.command_id),
+                "SELECT owner_id,pid FROM session_leases WHERE session_id=?",
+                (session_id,),
             ).fetchone()
             if row is not None:
-                if row["params_digest"] != envelope.params_digest:
-                    raise CommandConflictError("command_id 已被不同参数摘要使用")
-                return _response_from_json(row["response_json"]) or response
+                pid = int(row["pid"])
+                if pid != os.getpid() and _process_alive(pid):
+                    return str(row["owner_id"])
             db.execute(
-                "INSERT INTO commands(scope_type,scope_id,command_id,operation,params_digest,session_id,run_id,request_id,status,error_code,response_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (envelope.scope_type, envelope.scope_id, envelope.command_id, envelope.operation, envelope.params_digest, envelope.session_id, envelope.run_id, envelope.request_id, status, response.error_code, _response_json(response), now, now),
+                "INSERT INTO session_leases(session_id,workspace_id,owner_id,pid,acquired_at,updated_at) VALUES(?,?,?,?,?,?) "
+                "ON CONFLICT(session_id) DO UPDATE SET workspace_id=excluded.workspace_id,"
+                "owner_id=excluded.owner_id,pid=excluded.pid,acquired_at=excluded.acquired_at,"
+                "updated_at=excluded.updated_at",
+                (session_id, workspace_id, owner_id, os.getpid(), now, now),
             )
-        return response
+        return None
+
+    def release_session_lease(self, session_id: str) -> None:
+        """Release only a lease this process still owns.
+
+        The ``pid`` guard keeps a stale release from deleting a newer holder's
+        row after the session changed hands.
+        """
+
+        with self.transaction() as db:
+            db.execute(
+                "DELETE FROM session_leases WHERE session_id=? AND pid=?",
+                (session_id, os.getpid()),
+            )
+
+    def bind_pending_command(self, request_id: str, command_id: str) -> None:
+        """Bind the answering ``interaction.respond`` command to its row."""
+
+        with self.transaction() as db:
+            db.execute(
+                "UPDATE pending_interactions SET command_id=?,updated_at=? WHERE request_id=?",
+                (command_id, _utc_now(), request_id),
+            )
+
+    def insert_run(
+        self,
+        *,
+        session_id: str,
+        workspace_id: str,
+        command_id: str,
+        prompt_digest: str,
+        run_id: str,
+        response_json: str,
+        parent_run_id: str | None = None,
+        decision_generation: int = 0,
+        owner_pid: int | None = None,
+    ) -> sqlite3.Row:
+        """Commit the run row that doubles as the command-level idempotency key.
+
+        ``UNIQUE(session_id, command_id)`` is the durable gate: a retry of an
+        already-committed command returns the existing row instead of raising or
+        dispatching a second run.  ``response_json`` is the reply that retry
+        converges on; it is written in the same transaction, so a committed row
+        always has one.
+        """
+
+        now = _utc_now()
+        with self.transaction() as db:
+            existing = db.execute(
+                "SELECT * FROM runs WHERE session_id=? AND command_id=?",
+                (session_id, command_id),
+            ).fetchone()
+            if existing is not None:
+                return existing
+            db.execute(
+                "INSERT INTO runs(run_id,session_id,workspace_id,command_id,owner_pid,parent_run_id,decision_generation,status,error_code,prompt_digest,response_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (run_id, session_id, workspace_id, command_id, os.getpid() if owner_pid is None else int(owner_pid), parent_run_id, decision_generation, "queued", None, prompt_digest, response_json, now, now),
+            )
+            created = db.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
+        return created
 
     def update_run(
         self,
@@ -762,6 +651,7 @@ class ControlStore:
         error_code: str | None = None,
         result: Mapping[str, Any] | None = None,
         dispatch_intent: bool | None = None,
+        response_json: str | None = None,
     ) -> None:
         fields: dict[str, Any] = {"updated_at": _utc_now()}
         if status is not None:
@@ -772,6 +662,8 @@ class ControlStore:
             fields["result_json"] = json.dumps(result, ensure_ascii=False, sort_keys=True)
         if dispatch_intent is not None:
             fields["dispatch_intent"] = int(dispatch_intent)
+        if response_json is not None:
+            fields["response_json"] = response_json
         assignments = ",".join(f"{key}=?" for key in fields)
         with self.transaction() as db:
             db.execute(f"UPDATE runs SET {assignments} WHERE run_id=?", (*fields.values(), run_id))
@@ -834,24 +726,14 @@ class ControlStore:
     def runs_for_session(self, session_id: str) -> list[sqlite3.Row]:
         return self.connection.execute("SELECT * FROM runs WHERE session_id=? ORDER BY created_at,run_id", (session_id,)).fetchall()
 
-    def runs_for_owner(self, owner_id: str) -> list[sqlite3.Row]:
-        return self.connection.execute("SELECT * FROM runs WHERE owner_id=? ORDER BY created_at,run_id", (owner_id,)).fetchall()
-
-    def update_command_for_run(self, run_id: str, response: ApplicationResponse) -> None:
-        with self.transaction() as db:
-            db.execute(
-                "UPDATE commands SET status=?,error_code=?,response_json=?,updated_at=? WHERE run_id=?",
-                (response.status, response.error_code, _response_json(response), _utc_now(), run_id),
-            )
-
     def insert_pending(self, request: InteractionRequest, *, workspace_id: str, process_id: int) -> None:
         now = _utc_now()
         tool_input = getattr(request, "tool_input", None)
         metadata = getattr(request, "metadata", None)
         with self.transaction() as db:
             db.execute(
-                "INSERT OR REPLACE INTO pending_interactions(request_id,workspace_id,session_id,run_id,tool_call_id,tool_name,tool_input_json,plan_id,plan_digest,metadata_json,params_digest,prompt,expires_at,process_id,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (request.request_id, workspace_id, request.session_id, request.run_id, request.tool_call_id, request.tool_name, json.dumps(_redact_control_value(tool_input), ensure_ascii=False, sort_keys=True) if tool_input is not None else None, getattr(request, "plan_id", None), getattr(request, "plan_digest", None), json.dumps(_redact_control_value(metadata), ensure_ascii=False, sort_keys=True) if metadata is not None else None, request.params_digest, request.prompt, getattr(request, "expires_at_utc", None) or _expires_at_iso(request.expires_at), process_id, "pending", now, now),
+                "INSERT OR REPLACE INTO pending_interactions(request_id,workspace_id,session_id,run_id,tool_call_id,tool_name,tool_input_json,plan_id,plan_digest,metadata_json,params_digest,command_id,prompt,expires_at,process_id,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (request.request_id, workspace_id, request.session_id, request.run_id, request.tool_call_id, request.tool_name, json.dumps(_redact_control_value(tool_input), ensure_ascii=False, sort_keys=True) if tool_input is not None else None, getattr(request, "plan_id", None), getattr(request, "plan_digest", None), json.dumps(_redact_control_value(metadata), ensure_ascii=False, sort_keys=True) if metadata is not None else None, request.params_digest, getattr(request, "command_id", None), request.prompt, getattr(request, "expires_at_utc", None) or _expires_at_iso(request.expires_at), process_id, "pending", now, now),
             )
 
     def pending(self, request_id: str) -> sqlite3.Row | None:
@@ -927,57 +809,6 @@ class ControlStore:
                 "UPDATE cancel_generations SET status=?,error_code=?,updated_at=? WHERE run_id=?",
                 (status, error_code, _utc_now(), run_id),
             )
-
-    def record_tool_operation(
-        self,
-        *,
-        run_id: str,
-        operation_id: str,
-        provider_tool_call_id: str,
-        tool_name: str,
-        canonical_args_hash: str,
-        invocation_id: str | None = None,
-        turn_id: str | None = None,
-        state: str = "dispatched",
-    ) -> None:
-        with self.transaction() as db:
-            existing = db.execute(
-                "SELECT * FROM tool_operations WHERE operation_id=? OR (run_id=? AND provider_tool_call_id=?)",
-                (operation_id, run_id, provider_tool_call_id),
-            ).fetchone()
-            if existing is not None:
-                same = (
-                    existing["operation_id"] == operation_id
-                    and existing["run_id"] == run_id
-                    and existing["provider_tool_call_id"] == provider_tool_call_id
-                    and existing["tool_name"] == tool_name
-                    and existing["canonical_args_hash"] == canonical_args_hash
-                    and existing["invocation_id"] == invocation_id
-                    and existing["turn_id"] == turn_id
-                )
-                if same:
-                    return
-                raise ApplicationError("canonical tool identity conflict", code="control_canonical_conflict")
-            db.execute(
-                "INSERT INTO tool_operations(operation_id,run_id,invocation_id,turn_id,provider_tool_call_id,tool_name,canonical_args_hash,state) VALUES(?,?,?,?,?,?,?,?)",
-                (operation_id, run_id, invocation_id, turn_id, provider_tool_call_id, tool_name, canonical_args_hash, state),
-            )
-            rows = db.execute(
-                "SELECT operation_id,invocation_id,turn_id,provider_tool_call_id,tool_name,canonical_args_hash FROM tool_operations WHERE run_id=? ORDER BY operation_id",
-                (run_id,),
-            ).fetchall()
-            run = db.execute("SELECT session_id,run_id FROM runs WHERE run_id=?", (run_id,)).fetchone()
-            operations = [dict(row) for row in rows]
-            db.execute(
-                "UPDATE runs SET canonical_correlation_json=?,updated_at=? WHERE run_id=?",
-                (json.dumps({"version": 1, "session_id": run["session_id"] if run else None, "run_id": run_id, "tool_operations": operations, "invocation_ids": sorted({row["invocation_id"] for row in rows if row["invocation_id"]}), "turn_ids": sorted({row["turn_id"] for row in rows if row["turn_id"]})}, ensure_ascii=False, sort_keys=True), _utc_now(), run_id),
-            )
-
-    def tool_operations(self, run_id: str) -> list[sqlite3.Row]:
-        return self.connection.execute(
-            "SELECT * FROM tool_operations WHERE run_id=? ORDER BY operation_id",
-            (run_id,),
-        ).fetchall()
 
 
 def _expires_at_iso(value: float | str | None) -> str | None:
@@ -1128,13 +959,15 @@ class Application:
         self._interaction_bridges: dict[str, ApplicationInteractionPort] = {}
         self._tasks: dict[str, asyncio.Task[Any]] = {}
         self._cancel_requested: set[str] = set()
-        self._owner_lock: WorkspaceLock | None = None
-        self.owner_id: str | None = None
-        self.owner_generation = 0
+        # Sessions this process currently holds a lease for, plus the reverse
+        # run -> session map used to release only after the last run is done.
+        self._session_leases: set[str] = set()
+        self._run_sessions: dict[str, str] = {}
+        self._lease_owner_id = f"owner-{uuid.uuid4().hex}"
         self._closed = False
         self._shutting_down = False
         self.control.mark_old_pending_interrupted()
-        self._quarantine_dead_owners()
+        self._recover_orphaned_runs()
 
     # ---- session API -------------------------------------------------
 
@@ -1192,7 +1025,6 @@ class Application:
             "run.cancel": self.run_cancel,
             "run.resume": self.run_resume,
             "interaction.respond": self.interaction_respond,
-            "owner.reconcile": self.owner_reconcile,
             "shutdown": self.shutdown,
         }
         handler = routes.get(operation)
@@ -1233,85 +1065,89 @@ class Application:
                 session_id=session_id, error_code="digest_conflict",
                 data={"expected_params_digest": computed_digest},
             )
-        digest = computed_digest
-        envelope = CommandEnvelope(
-            command_id=command_id,
-            scope_type="session",
-            scope_id=session_id,
-            operation="run.start",
-            params_digest=digest,
-            session_id=session_id,
-            run_id=run_id,
-        )
-        existing = self.control.get_command(envelope)
-        if existing is not None:
-            if existing["params_digest"] != digest:
-                return self._error_response(envelope, "digest_conflict")
-            stored = _response_from_json(existing["response_json"])
-            if stored is not None:
-                return stored
+        prompt_digest = full_sha256({"prompt": prompt})
         run_id = requested_run_id or f"run-{uuid.uuid4().hex}"
-        owner_response = self._acquire_root_owner()
-        if owner_response is not None:
-            # A second process may observe the owner lock just before the
-            # first process commits its command row.  Give the durable row a
-            # short chance to appear so identical cross-process commands
-            # converge on one result instead of spuriously returning a race.
-            if owner_response.error_code == "owner_conflict":
-                for _ in range(50):
-                    await asyncio.sleep(0.01)
-                    existing = self.control.get_command(envelope)
-                    if existing is not None:
-                        if existing["params_digest"] != digest:
-                            return self._error_response(envelope, "digest_conflict")
-                        stored = _response_from_json(existing["response_json"])
-                        if stored is not None:
-                            return stored
-            return self._error_response(envelope, owner_response.error_code or "owner_conflict", data=owner_response.data)
-        assert self.owner_id is not None
-        try:
-            response = self.control.insert_run_and_command(
-                envelope,
-                run_id=run_id,
+        # 1. Command-level idempotency: a retry of a committed command returns
+        #    the durable reply instead of dispatching a second run.
+        existing = self.control.run_for_command(session_id, command_id)
+        if existing is not None:
+            return self._stored_run_response(existing, command_id=command_id, prompt_digest=prompt_digest)
+        # 2. The session lease is the only execution mutex.  A live foreign
+        #    holder is refused; a lease left behind by a dead process is adopted.
+        if not self._own_session(session_id):
+            holder = self.control.acquire_session_lease(
+                session_id=session_id,
                 workspace_id=self.context.workspace_id,
-                owner_id=self.owner_id,
-                prompt_digest=full_sha256({"prompt": prompt}),
+                owner_id=self._lease_owner_id,
+            )
+            if holder is not None:
+                return ApplicationResponse(
+                    "run.start", "rejected", "error",
+                    command_id=command_id, session_id=session_id,
+                    error_code="session_busy",
+                    data={"session_id": session_id, "holder_owner_id": holder},
+                )
+            self._session_leases.add(session_id)
+        queued = ApplicationResponse(
+            "run.start", "queued", "accepted",
+            command_id=command_id, session_id=session_id, run_id=run_id,
+            data={"owner_pid": os.getpid(), "dispatch_intent": False},
+        )
+        # 3. Commit before dispatch.  Nothing that can construct an Agent or
+        #    call a provider happens before this transaction succeeds.
+        try:
+            row = self.control.insert_run(
+                session_id=session_id,
+                workspace_id=self.context.workspace_id,
+                command_id=command_id,
+                prompt_digest=prompt_digest,
+                run_id=run_id,
+                response_json=_response_json(queued),
                 parent_run_id=parent_run_id,
                 decision_generation=decision_generation,
             )
-        except CommandConflictError:
-            self._release_owner(status="released")
-            return self._error_response(envelope, "digest_conflict")
         except Exception as exc:
             # A failed control commit is still before the dispatch barrier;
-            # release the capability so a later root can retry safely.
-            self._release_owner(status="released")
-            return self._error_response(
-                envelope,
-                "control_commit_error",
+            # release the lease so a later attempt can retry safely.
+            if not self._session_has_live_run(session_id):
+                self._release_session_lease(session_id)
+            return ApplicationResponse(
+                "run.start", "rejected", "error",
+                command_id=command_id, session_id=session_id,
+                error_code="control_commit_error",
                 data={"error_type": type(exc).__name__},
             )
-        if response.result != "accepted":
-            return response
-        # The control commit above is the dispatch barrier.  Nothing that can
-        # call a provider is constructed before it succeeds.
-        execution = self._execute_run(response.run_id or run_id, session_id, prompt)
+        if str(row["run_id"]) != run_id:
+            # Another client committed this command between the read above and
+            # this insert; converge on its run instead of dispatching twice.
+            # Dispatching nothing here also means the lease taken above must not
+            # be kept when this process has no live run of that session.
+            if not self._session_has_live_run(session_id):
+                self._release_session_lease(session_id)
+            return self._stored_run_response(row, command_id=command_id, prompt_digest=prompt_digest)
+        execution = self._execute_run(run_id, session_id, prompt)
         try:
             task = asyncio.create_task(execution)
         except Exception as exc:
             execution.close()
-            self.control.update_run(run_id, status="interrupted", error_code="run_dispatch_not_observed")
-            self._release_owner(status="released")
             failed = ApplicationResponse(
                 "run.start", "interrupted", "error", command_id=command_id,
                 session_id=session_id, run_id=run_id,
                 error_code="run_dispatch_not_observed",
                 data={"error_type": type(exc).__name__},
             )
-            self.control.update_command_for_run(run_id, failed)
+            self.control.update_run(
+                run_id,
+                status="interrupted",
+                error_code="run_dispatch_not_observed",
+                response_json=_response_json(failed),
+            )
+            if not self._session_has_live_run(session_id):
+                self._release_session_lease(session_id)
             return failed
         self._tasks[run_id] = task
-        return response
+        self._run_sessions[run_id] = session_id
+        return queued
 
     async def wait_run(self, run_id: str) -> ApplicationResponse:
         task = self._tasks.get(run_id)
@@ -1326,7 +1162,7 @@ class Application:
         if row is None:
             return ApplicationResponse("run.status", "missing", "error", run_id=run_id, error_code="run_not_found")
         data: dict[str, Any] = {
-            "owner_id": row["owner_id"],
+            "owner_pid": int(row["owner_pid"]),
             "error_code": row["error_code"],
             "dispatch_intent": bool(row["dispatch_intent"]),
             "decision_generation": int(row["decision_generation"]),
@@ -1356,27 +1192,12 @@ class Application:
             return ApplicationResponse("run.cancel", "missing", "error", run_id=run_id, error_code="run_not_found")
         if row["status"] in {"succeeded", "failed", "cancelled", "interrupted", "uncertain"}:
             return ApplicationResponse("run.cancel", row["status"], "ok", command_id=command_id, session_id=row["session_id"], run_id=run_id, error_code=row["error_code"], data={"already_terminal": True})
-        cancel_envelope = CommandEnvelope(
-            command_id=command_id,
-            scope_type="run",
-            scope_id=run_id,
-            operation="run.cancel",
-            params_digest=full_sha256({"run_id": run_id}),
-            session_id=row["session_id"],
-            run_id=run_id,
-        )
-        existing_command = self.control.get_command(cancel_envelope)
-        if existing_command is not None:
-            if existing_command["params_digest"] != cancel_envelope.params_digest:
-                return self._error_response(cancel_envelope, "digest_conflict")
-            stored = _response_from_json(existing_command["response_json"])
-            if stored is not None:
-                return stored
         generation, created, existing = self.control.create_cancel(run_id, command_id)
         if not created:
+            # A repeated cancel of the same run is idempotent: the durable
+            # cancel generation, not a command ledger, is the dedup key.
             status = existing["status"] if existing is not None else "cancelling"
-            response = ApplicationResponse("run.cancel", status, "ok", command_id=command_id, session_id=row["session_id"], run_id=run_id, data={"cancel_generation": generation})
-            return self.control.record_command(cancel_envelope, response)
+            return ApplicationResponse("run.cancel", status, "ok", command_id=command_id, session_id=row["session_id"], run_id=run_id, data={"cancel_generation": generation})
         self._cancel_requested.add(run_id)
         self.control.update_run(run_id, status="cancelling", error_code="cancel_propagation_unconfirmed")
         agent = self._agents.get(run_id)
@@ -1387,8 +1208,7 @@ class Application:
             abort = getattr(agent, "abort", None)
             if callable(abort):
                 abort()
-        response = ApplicationResponse("run.cancel", "cancelling", "accepted", command_id=command_id, session_id=row["session_id"], run_id=run_id, data={"cancel_generation": generation})
-        return self.control.record_command(cancel_envelope, response)
+        return ApplicationResponse("run.cancel", "cancelling", "accepted", command_id=command_id, session_id=row["session_id"], run_id=run_id, data={"cancel_generation": generation})
 
     async def run_resume(self, *, run_id: str, prompt: str, command_id: str | None = None) -> ApplicationResponse:
         self._ensure_open()
@@ -1408,8 +1228,15 @@ class Application:
 
     # ---- interaction API --------------------------------------------
 
-    async def interaction_respond(self, reply: InteractionReply | None = None, **fields: Any) -> ApplicationResponse:
+    async def interaction_respond(
+        self,
+        reply: InteractionReply | None = None,
+        command_id: str | None = None,
+        **fields: Any,
+    ) -> ApplicationResponse:
         self._ensure_open()
+        if command_id is None:
+            command_id = fields.pop("command_id", None)
         if reply is None:
             try:
                 reply = InteractionReply(**fields)
@@ -1423,6 +1250,12 @@ class Application:
         request_row = self.control.pending(reply.request_id)
         if request_row is None:
             return ApplicationResponse("interaction.respond", "rejected", "error", request_id=reply.request_id, error_code="interaction_interrupted")
+        if command_id is not None and request_row["command_id"] == command_id and request_row["status"] == "resolved":
+            # 幂等：同一 command_id 的重放返回既有回复，不二次 resolve。
+            # 行绑定校验仍然先行：重放载荷与持久行不符时一律按绑定错误拒绝。
+            if not self._reply_matches_row(reply, request_row):
+                return ApplicationResponse("interaction.respond", "rejected", "error", request_id=reply.request_id, run_id=request_row["run_id"], error_code="interaction_binding_error")
+            return self._resolved_interaction_response(request_row, command_id)
         if request_row["status"] in {"interrupted", "expired", "cancelled", "resolved"}:
             return ApplicationResponse(
                 "interaction.respond", "rejected", "error", request_id=reply.request_id,
@@ -1438,52 +1271,13 @@ class Application:
             resolved = bridge.resolve_external(reply)
         except InteractionError:
             return ApplicationResponse("interaction.respond", "rejected", "error", request_id=reply.request_id, run_id=request_row["run_id"], error_code="interaction_binding_error")
-        return ApplicationResponse("interaction.respond", "resolved", "ok", request_id=reply.request_id, session_id=request_row["session_id"], run_id=request_row["run_id"], data={"approved": bool(resolved.approved)})
+        if command_id is not None:
+            # Bind the answering command so a transport-level retry converges
+            # instead of resolving the request a second time.
+            self.control.bind_pending_command(reply.request_id, command_id)
+        return ApplicationResponse("interaction.respond", "resolved", "ok", command_id=command_id, request_id=reply.request_id, session_id=request_row["session_id"], run_id=request_row["run_id"], data={"approved": bool(resolved.approved)})
 
-    # ---- owner and shutdown -----------------------------------------
-
-    def owner_reconcile(self, *, owner_id: str, generation: int, action: str, evidence: Mapping[str, Any]) -> ApplicationResponse:
-        self._ensure_open()
-        if action not in {"inspect", "terminate", "release"}:
-            return ApplicationResponse("owner.reconcile", "rejected", "error", error_code="invalid_reconcile_action")
-        row = self.control.owner(owner_id)
-        if row is None or row["workspace_id"] != self.context.workspace_id or int(row["generation"]) != generation:
-            return ApplicationResponse("owner.reconcile", "rejected", "error", error_code="owner_identity_conflict")
-        if action == "inspect":
-            return ApplicationResponse("owner.reconcile", "inspected", "ok", data={"owner": dict(row)})
-        if not isinstance(evidence, Mapping) or not evidence:
-            return ApplicationResponse("owner.reconcile", "rejected", "error", error_code="owner_evidence_required")
-        # A live owner is a capability held by its owning Application.  A
-        # different Application must not release or terminate it merely by
-        # presenting arbitrary evidence; the physical workspace lock remains
-        # held and the durable row must stay active.  Reconciliation is only
-        # available once the recorded process has died (or the owner is
-        # already quarantined).
-        if (
-            row["status"] == "active"
-            and not int(row["quarantine"])
-            and owner_id != self.owner_id
-            and _process_alive(int(row["process_id"]))
-        ):
-            return ApplicationResponse("owner.reconcile", "rejected", "error", error_code="owner_foreign_active", data={"owner_id": owner_id})
-        active_runs = [run for run in self.control.runs_for_owner(owner_id) if run["status"] in {"queued", "running", "waiting_interaction", "cancelling"}]
-        if action == "terminate":
-            for run in active_runs:
-                self._cancel_requested.add(str(run["run_id"]))
-                self.control.update_run(str(run["run_id"]), status="cancelling", error_code="cancel_propagation_unconfirmed")
-                agent = self._agents.get(str(run["run_id"]))
-                abort = getattr(agent, "abort", None) if agent is not None else None
-                if callable(abort):
-                    abort()
-            if active_runs:
-                return ApplicationResponse("owner.reconcile", "terminating", "ok", data={"owner_id": owner_id, "active_runs": [run["run_id"] for run in active_runs]})
-        next_status = "terminated" if action == "terminate" else "released"
-        self.control.update_owner(owner_id, status=next_status, quarantine=0, evidence_json=json.dumps(dict(evidence), sort_keys=True))
-        if owner_id == self.owner_id and self._owner_lock is not None:
-            self._owner_lock.release()
-            self._owner_lock = None
-            self.owner_id = None
-        return ApplicationResponse("owner.reconcile", next_status, "ok", data={"owner_id": owner_id, "action": action})
+    # ---- shutdown ----------------------------------------------------
 
     async def shutdown(self, *, timeout: float = 5.0) -> ApplicationResponse:
         if self._closed:
@@ -1513,7 +1307,8 @@ class Application:
             with contextlib.suppress(Exception):
                 store.close()
         self._stores.clear()
-        self._release_owner(status="released")
+        for session_id in list(self._session_leases):
+            self._release_session_lease(session_id)
         if self._owns_control:
             self.control.close()
         self._closed = True
@@ -1541,87 +1336,92 @@ class Application:
                 canonical_path=canonical_path,
             )
 
-    def _acquire_root_owner(self) -> ApplicationResponse | None:
-        if self._owner_lock is not None and self._owner_lock.held:
-            if any(not task.done() for task in self._tasks.values()):
-                return ApplicationResponse("owner", "rejected", "error", error_code="owner_conflict", data={"owner_id": self.owner_id})
-            # Holding this root's own capability is not enough to start more
-            # work: a quarantined row still blocks the workspace, so re-check
-            # rather than returning early.
-            blocked = self._quarantine_response(exclude_owner=self.owner_id)
-            if blocked is not None:
-                return blocked
-            return None
-        blocked = self._quarantine_response()
-        if blocked is not None:
-            return blocked
-        owner_id = f"owner-{uuid.uuid4().hex}"
-        lock_path = self.context.runtime_data_dir / "application" / self.context.workspace_id / "locks" / f"{workspace_lock_key(self.context.workspace_id)}.lock"
-        lock = WorkspaceLock(lock_path, workspace_id=self.context.workspace_id, owner_id=owner_id)
-        try:
-            lock.acquire()
-        except WorkspaceLockBusyError:
-            return ApplicationResponse("owner", "rejected", "error", error_code="owner_conflict")
-        try:
-            self.owner_generation += 1
-            self.control.insert_owner(owner_id=owner_id, workspace_id=self.context.workspace_id, generation=self.owner_generation, lock_key=lock.key)
-        except Exception:
-            lock.release()
-            raise
-        self._owner_lock = lock
-        self.owner_id = owner_id
-        return None
+    def _own_session(self, session_id: str) -> bool:
+        return session_id in self._session_leases
 
-    def _quarantine_response(self, *, exclude_owner: str | None = None) -> ApplicationResponse | None:
-        """Return a refusal if any other owner row blocks this workspace.
+    def _release_session_lease(self, session_id: str) -> None:
+        self._session_leases.discard(session_id)
+        with contextlib.suppress(Exception):
+            self.control.release_session_lease(session_id)
 
-        A quarantined owner is not adoptable by a later root regardless of the
-        status label it carries: ``_quarantine_dead_owners`` moves a crashed root
-        to ``uncertain``, and if that label alone released the workspace the
-        crash would silently hand over ownership.  Only an explicit
-        ``owner.reconcile`` clears the quarantine flag.
+    def _session_has_live_run(self, session_id: str) -> bool:
+        for run_id, run_session in self._run_sessions.items():
+            if run_session != session_id:
+                continue
+            task = self._tasks.get(run_id)
+            if task is not None and not task.done():
+                return True
+        return False
+
+    @staticmethod
+    def _stored_run_response(row: sqlite3.Row, *, command_id: str, prompt_digest: str) -> ApplicationResponse:
+        """Return the committed reply for an already-committed command.
+
+        A replay whose parameters no longer match the committed row is refused
+        rather than answered with the first run's result.
         """
 
-        for stale in self.control.owner_rows(self.context.workspace_id):
-            if exclude_owner is not None and stale["owner_id"] == exclude_owner:
+        stored_digest = row["prompt_digest"]
+        if stored_digest is not None and str(stored_digest) != prompt_digest:
+            return ApplicationResponse(
+                "run.start", "rejected", "error",
+                command_id=command_id, session_id=row["session_id"], run_id=row["run_id"],
+                error_code="digest_conflict",
+            )
+        stored = _response_from_json(row["response_json"])
+        if stored is not None:
+            return stored
+        return ApplicationResponse(
+            "run.start", str(row["status"]), "ok",
+            command_id=command_id, session_id=row["session_id"], run_id=row["run_id"],
+            error_code=row["error_code"],
+            data={"dispatch_intent": bool(row["dispatch_intent"])},
+        )
+
+    @staticmethod
+    def _resolved_interaction_response(row: sqlite3.Row, command_id: str) -> ApplicationResponse:
+        approved = False
+        if row["reply_json"]:
+            with contextlib.suppress(json.JSONDecodeError):
+                approved = bool(json.loads(row["reply_json"]).get("approved"))
+        return ApplicationResponse(
+            "interaction.respond", "resolved", "ok",
+            command_id=command_id, request_id=row["request_id"],
+            session_id=row["session_id"], run_id=row["run_id"],
+            data={"approved": approved, "replayed": True},
+        )
+
+    def _recover_orphaned_runs(self) -> None:
+        """Classify runs a crashed process left non-terminal.
+
+        This is diagnosis, never a gate: nothing here refuses a new request or
+        makes the workspace unavailable.  Rows owned by this process are
+        skipped, which also removes any dependence on pid reuse.
+        """
+
+        for row in self.control.non_terminal_runs():
+            owner_pid = int(row["owner_pid"])
+            if owner_pid == os.getpid():
                 continue
-            if int(stale["quarantine"]):
-                return ApplicationResponse("owner", "rejected", "error", error_code="owner_quarantine", data={"owner_id": stale["owner_id"], "generation": stale["generation"]})
-            if stale["status"] == "active" and _process_alive(int(stale["process_id"])):
-                return ApplicationResponse("owner", "rejected", "error", error_code="owner_conflict", data={"owner_id": stale["owner_id"]})
-            if stale["status"] == "active":
-                self.control.update_owner(stale["owner_id"], status="uncertain", quarantine=1, evidence_json=json.dumps({"reason": "root_process_missing"}, sort_keys=True))
-                return ApplicationResponse("owner", "rejected", "error", error_code="owner_quarantine", data={"owner_id": stale["owner_id"], "generation": stale["generation"]})
-        return None
-
-    def _release_owner(self, *, status: str) -> None:
-        if self.owner_id is not None:
-            with contextlib.suppress(Exception):
-                self.control.update_owner(self.owner_id, status=status, quarantine=0)
-        if self._owner_lock is not None:
-            self._owner_lock.release()
-            self._owner_lock = None
-        self.owner_id = None
-
-    def _quarantine_dead_owners(self) -> None:
-        for row in self.control.owner_rows(self.context.workspace_id):
-            if row["status"] == "active" and not _process_alive(int(row["process_id"])):
-                self.control.update_owner(row["owner_id"], status="uncertain", quarantine=1, evidence_json=json.dumps({"reason": "root_process_missing"}, sort_keys=True))
-                for run in self.control.runs_for_owner(row["owner_id"]):
-                    if run["status"] in {"queued", "running", "waiting_interaction", "cancelling"}:
-                        if not run["dispatch_intent"]:
-                            self.control.update_run(run["run_id"], status="interrupted", error_code="run_interrupted_before_dispatch")
-                        else:
-                            projection = self._project_recovered_run(run)
-                            self.control.update_run(
-                                run["run_id"],
-                                status=projection.status,
-                                error_code=projection.error_code,
-                                result={
-                                    "canonical_correlation": dict(projection.correlation),
-                                    "side_effect_count": projection.side_effect_count,
-                                },
-                            )
+            if owner_pid and _process_alive(owner_pid):
+                continue
+            if not row["dispatch_intent"]:
+                self.control.update_run(
+                    str(row["run_id"]),
+                    status="interrupted",
+                    error_code="run_interrupted_before_dispatch",
+                )
+                continue
+            projection = self._project_recovered_run(row)
+            self.control.update_run(
+                str(row["run_id"]),
+                status=projection.status,
+                error_code=projection.error_code,
+                result={
+                    "canonical_correlation": dict(projection.correlation),
+                    "side_effect_count": projection.side_effect_count,
+                },
+            )
 
     def _project_recovered_run(self, run: sqlite3.Row) -> CanonicalProjection:
         """Read canonical facts only; never infer a dispatch from control intent."""
@@ -1645,7 +1445,6 @@ class Application:
                 session_id=str(run["session_id"]),
                 run_id=str(run["run_id"]),
             )
-            self._persist_projection_tool_operations(str(run["run_id"]), projection)
             return projection
         except Exception:
             return CanonicalProjection(
@@ -1654,27 +1453,6 @@ class Application:
                 None,
                 {"session_id": run["session_id"], "run_id": run["run_id"], "tool_operations": []},
                 0,
-            )
-
-    def _persist_projection_tool_operations(self, run_id: str, projection: CanonicalProjection) -> None:
-        """Materialize canonical tool identities in the C03 control ledger.
-
-        The event store remains the source of truth.  This table is a durable
-        correlation/index used for idempotency and recovery reporting, so an
-        operation is recorded only after projection has validated its complete
-        identity.  Replaying the same projection is idempotent.
-        """
-
-        for operation in projection.correlation.get("tool_operations", []):
-            self.control.record_tool_operation(
-                run_id=run_id,
-                operation_id=str(operation["operation_id"]),
-                provider_tool_call_id=str(operation["provider_tool_call_id"]),
-                tool_name=str(operation["tool_name"]),
-                canonical_args_hash=str(operation["canonical_args_hash"]),
-                invocation_id=operation.get("invocation_id"),
-                turn_id=operation.get("turn_id"),
-                state="completed" if projection.status == "succeeded" else "dispatched",
             )
 
     async def _execute_run(self, run_id: str, session_id: str, prompt: str) -> None:
@@ -1726,25 +1504,19 @@ class Application:
                 agent.set_interaction_port(bridge)
             await agent.chat(prompt)
             control_row = self.control.run(run_id)
-            # A restart/recovery owner may have classified this run while the
-            # old task was still unwinding.  Never let that stale task
-            # overwrite an ``interrupted``/``uncertain`` decision with a
-            # locally inferred success.
+            # The recovery scan may have classified this run while this task
+            # was still unwinding.  Never let the stale task overwrite an
+            # ``interrupted``/``uncertain`` decision with a locally inferred
+            # success.
             if control_row is not None and control_row["status"] in {"interrupted", "uncertain"}:
                 return
             canonical_events = store.read_events(session_id=session_id, run_id=run_id)
             if canonical_events:
+                # The canonical ledger is the only side-effect record now; the
+                # control store keeps no parallel tool-operation tally.
                 projection = project_canonical_evidence(
                     canonical_events, session_id=session_id, run_id=run_id,
-                    side_effect_count=len(self.control.tool_operations(run_id)),
                 )
-                try:
-                    self._persist_projection_tool_operations(run_id, projection)
-                except ApplicationError as exc:
-                    projection = CanonicalProjection(
-                        "uncertain", exc.code, None, projection.correlation,
-                        max(projection.side_effect_count, len(self.control.tool_operations(run_id))),
-                    )
                 self.control.update_correlation(run_id, projection.correlation)
                 self.control.finalize_run(
                     run_id,
@@ -1784,10 +1556,13 @@ class Application:
             status_row = self.control.run(run_id)
             if status_row is not None:
                 response = ApplicationResponse("run.start", status_row["status"], "ok" if status_row["status"] in {"succeeded", "failed", "cancelled"} else "error", command_id=status_row["command_id"], session_id=session_id, run_id=run_id, error_code=status_row["error_code"], data={"dispatch_intent": bool(status_row["dispatch_intent"])})
-                self.control.update_command_for_run(run_id, response)
+                self.control.update_run(run_id, response_json=_response_json(response))
             self._tasks.pop(run_id, None)
-            if not any(not task.done() for task in self._tasks.values()):
-                self._release_owner(status="released")
+            self._run_sessions.pop(run_id, None)
+            # Only this run's own session may be released here; other sessions
+            # keep their own leases (a GUI holds several at once).
+            if not self._session_has_live_run(session_id):
+                self._release_session_lease(session_id)
 
     def _interaction_bridges_by_agent(self, agent: Any, bridge: ApplicationInteractionPort) -> None:
         # A request is added lazily when C02 calls bridge.request.  Keeping a
@@ -1833,9 +1608,6 @@ class Application:
         if getattr(reply, "metadata", None) != stored_metadata:
             return False
         return True
-    @staticmethod
-    def _error_response(envelope: CommandEnvelope, code: str, *, data: Mapping[str, Any] | None = None) -> ApplicationResponse:
-        return ApplicationResponse(envelope.operation, "rejected", "error", command_id=envelope.command_id, session_id=envelope.session_id, run_id=envelope.run_id, error_code=code, data=data or {})
 
 
 def _contains_redaction(value: Any) -> bool:

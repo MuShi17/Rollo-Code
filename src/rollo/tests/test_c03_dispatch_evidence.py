@@ -7,10 +7,10 @@ the frozen D14 mapping is ``interrupted``/``run_dispatch_not_observed`` — and 
 recovery path in the same module already classifies it that way, so the live and
 recovery paths disagreed about identical evidence.
 
-Round-3 also found the guard's ``owner_reconcile`` action dispatch had no oracle
-at all: mutants that turned ``inspect`` into a release, or that dropped the
-action whitelist, kept the whole suite green while a probe showed a *misspelled*
-action clearing a crashed owner's quarantine and handing over the workspace.
+The v3 convergence removed the owner/quarantine gate entirely: a dead process
+holds nothing, so a crash is classified (``_recover_orphaned_runs``) and never
+blocks the workspace.  The former ``owner_reconcile`` oracles are replaced by
+oracles for that property.
 """
 
 from __future__ import annotations
@@ -178,86 +178,100 @@ def test_ledger_evidence_is_still_respected(tmp_path: Path):
     asyncio.run(scenario())
 
 
-def _seed_crashed_owner(context: ProjectContext) -> ControlStore:
+def _seed_crashed_run(
+    context: ProjectContext,
+    *,
+    session_id: str,
+    run_id: str,
+    dispatch_intent: int,
+) -> ControlStore:
+    """Create the durable state a process that died mid-run leaves behind."""
+
     store = ControlStore(
         context.runtime_data_dir / "application" / context.workspace_id / "control.sqlite"
     )
-    store.insert_owner(
-        owner_id="owner-crashed", workspace_id=context.workspace_id, generation=1, lock_key="k"
-    )
+    now = "2026-01-01T00:00:00.000Z"
     store.connection.execute(
-        "UPDATE owners SET process_id=999999999, status='uncertain', quarantine=1 "
-        "WHERE owner_id='owner-crashed'"
+        "INSERT INTO runs(run_id,session_id,workspace_id,command_id,owner_pid,decision_generation,"
+        "status,error_code,prompt_digest,dispatch_intent,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            run_id, session_id, context.workspace_id, f"cmd-{run_id}", 999_999_999, 0,
+            "running", None, "digest", dispatch_intent, now, now,
+        ),
     )
     return store
 
 
-def test_owner_reconcile_rejects_unknown_action_without_touching_quarantine(tmp_path: Path):
-    """A misspelled action must never clear the quarantine (round-3 M1)."""
+def test_crashed_process_never_blocks_the_workspace(tmp_path: Path):
+    """Crash recovery only classifies; the workspace stays immediately usable.
+
+    This replaces the removed owner-quarantine oracles.  A dead process holds
+    nothing, so the only durable effect of its crash is the D14 classification
+    of the run it left behind - and no new request may be refused because of it.
+    """
 
     context = ProjectContext.from_root(tmp_path, runtime_data_dir=tmp_path / "runtime")
-    app = Application(context, agent_factory=lambda **kwargs: None)
-    store = _seed_crashed_owner(context)
+    store = _seed_crashed_run(
+        context, session_id="session-crashed", run_id="run-crashed", dispatch_intent=0
+    )
+
+    async def scenario():
+        app = Application(context, agent_factory=_NonCanonicalAgent)
+        try:
+            # 1. D14: no dispatch intent -> interrupted/run_interrupted_before_dispatch.
+            row = app.control.run("run-crashed")
+            assert row["status"] == "interrupted", dict(row)
+            assert row["error_code"] == "run_interrupted_before_dispatch", dict(row)
+            # 2. The classification refuses nothing: the next run of this
+            #    workspace is accepted and executed without any operator action.
+            session = app.session_create("session-after-crash").session_id
+            started = await app.run_start(
+                session_id=session, prompt="hi", command_id="after-crash-cmd"
+            )
+            assert started.error_code is None, started
+            assert (await app.wait_run(started.run_id)).status == "succeeded"
+        finally:
+            await app.shutdown()
+
     try:
-        response = app.owner_reconcile(
-            owner_id="owner-crashed", generation=1, action="relese", evidence={"why": "typo"}
-        )
-        assert response.status == "rejected", response
-        assert response.error_code == "invalid_reconcile_action", response
-        row = store.owner("owner-crashed")
-        assert row["status"] == "uncertain", dict(row)
-        assert int(row["quarantine"]) == 1, dict(row)
+        asyncio.run(scenario())
     finally:
         store.close()
-        asyncio.run(app.shutdown())
 
 
-def test_owner_reconcile_inspect_is_read_only(tmp_path: Path):
-    """``inspect`` must never mutate the owner row (round-3 M9)."""
+def test_stale_session_lease_is_reclaimed_without_operator_action(tmp_path: Path):
+    """A lease whose holder is gone is stale evidence, not a permanent lock.
+
+    v2 made a crashed owner quarantine the workspace with no automatic expiry
+    and no reachable clearing path outside its CLI/TUI -- the defect this
+    convergence removes.
+    """
 
     context = ProjectContext.from_root(tmp_path, runtime_data_dir=tmp_path / "runtime")
-    app = Application(context, agent_factory=lambda **kwargs: None)
-    store = _seed_crashed_owner(context)
-    try:
-        response = app.owner_reconcile(
-            owner_id="owner-crashed", generation=1, action="inspect", evidence={"why": "look"}
+    session_id = "session-stale-lease"
+    store = ControlStore(
+        context.runtime_data_dir / "application" / context.workspace_id / "control.sqlite"
+    )
+    now = "2026-01-01T00:00:00.000Z"
+    with store.transaction() as db:
+        db.execute(
+            "INSERT INTO session_leases(session_id,workspace_id,owner_id,pid,acquired_at,updated_at) VALUES(?,?,?,?,?,?)",
+            (session_id, context.workspace_id, "owner-dead", 999_999_999, now, now),
         )
-        assert response.status == "inspected", response
-        assert response.result == "ok", response
-        row = store.owner("owner-crashed")
-        assert row["status"] == "uncertain", dict(row)
-        assert int(row["quarantine"]) == 1, dict(row)
+
+    async def scenario():
+        app = Application(context, agent_factory=_NonCanonicalAgent, control_store=store)
+        try:
+            session = app.session_create(session_id).session_id
+            started = await app.run_start(session_id=session, prompt="hi", command_id="stale-cmd")
+            assert started.error_code is None, started
+            assert (await app.wait_run(started.run_id)).status == "succeeded"
+            # The lease was adopted and then released by its new holder.
+            assert app.control.session_lease(session) is None
+        finally:
+            await app.shutdown()
+
+    try:
+        asyncio.run(scenario())
     finally:
         store.close()
-        asyncio.run(app.shutdown())
-
-
-def test_owner_reconcile_requires_evidence_and_bound_generation(tmp_path: Path):
-    """``owner_evidence_required`` and ``owner_identity_conflict`` had no oracle."""
-
-    context = ProjectContext.from_root(tmp_path, runtime_data_dir=tmp_path / "runtime")
-    app = Application(context, agent_factory=lambda **kwargs: None)
-    store = _seed_crashed_owner(context)
-    try:
-        no_evidence = app.owner_reconcile(
-            owner_id="owner-crashed", generation=1, action="release", evidence={}
-        )
-        assert no_evidence.error_code == "owner_evidence_required", no_evidence
-
-        wrong_generation = app.owner_reconcile(
-            owner_id="owner-crashed", generation=99, action="release", evidence={"why": "x"}
-        )
-        assert wrong_generation.error_code == "owner_identity_conflict", wrong_generation
-
-        unknown_owner = app.owner_reconcile(
-            owner_id="owner-unknown", generation=1, action="release", evidence={"why": "x"}
-        )
-        assert unknown_owner.error_code == "owner_identity_conflict", unknown_owner
-
-        # None of the refusals may have released the workspace.
-        row = store.owner("owner-crashed")
-        assert row["status"] == "uncertain", dict(row)
-        assert int(row["quarantine"]) == 1, dict(row)
-    finally:
-        store.close()
-        asyncio.run(app.shutdown())

@@ -244,6 +244,48 @@ def test_unknown_request_id_is_rejected_as_interrupted(tmp_path):
     asyncio.run(scenario())
 
 
+def test_interaction_respond_replay_with_the_same_command_id_is_idempotent(tmp_path):
+    """``pending_interactions.command_id`` is the interaction-level idempotency key.
+
+    A host that retries a lost ``interaction.respond`` reply must get the
+    original answer back instead of resolving the request twice - and a replay
+    whose payload no longer matches the persisted row stays a binding error.
+    """
+
+    async def scenario():
+        app, session, run_id = await _pending_context(tmp_path)
+        try:
+            payload = _base_reply(session, run_id)
+            first = await app.interaction_respond(command_id="respond-command-1", **payload)
+            assert first.status == "resolved", first
+            assert first.error_code is None, first
+            assert app.control.pending("request-1")["command_id"] == "respond-command-1"
+
+            replay = await app.interaction_respond(command_id="respond-command-1", **payload)
+            assert replay.status == "resolved", replay
+            assert replay.error_code is None, replay
+            assert replay.command_id == "respond-command-1", replay
+            assert replay.data.get("replayed") is True, replay
+            assert replay.data["approved"] is True, replay
+
+            # A different command id is not a replay: the request is terminal,
+            # so it is refused as interrupted instead of being resolved again.
+            late = await app.interaction_respond(command_id="respond-command-2", **payload)
+            assert late.status == "rejected", late
+            assert late.error_code == "interaction_interrupted", late
+
+            # And a replay carrying tampered identity must not be answered with
+            # the stored reply.
+            tampered = dict(payload, tool_name="run_shell")
+            forged = await app.interaction_respond(command_id="respond-command-1", **tampered)
+            assert forged.status == "rejected", forged
+            assert forged.error_code == "interaction_binding_error", forged
+        finally:
+            await app.shutdown()
+
+    asyncio.run(scenario())
+
+
 def test_exact_reply_is_accepted_once_and_a_second_identical_reply_is_not_re_dispatched(tmp_path):
     """The positive control: the exact envelope resolves, tampering does not."""
 

@@ -1,9 +1,31 @@
+## 0. v3 收敛状态（2026-09-13，先读）
+
+**方案 v3 修订了 C03 的范围**：执行互斥单位由 workspace 改为 **session**；`owner` 锁/闸门、`owner.reconcile`、`commands` 命令台账（`CommandEnvelope` + `params_digest` 命令载体）、`tool_operations` 控制侧副本、control↔canonical 跨库一致性、RFC 8785/JCS 摘要**全部取消**；`workspace_lock.py` 删除。理由见任务卡 §10 与批次总览 §14。
+
+**本文件中以下条目已被 v3 作废，其 `[x]` 不再代表有效实现**（保留原文与勾选以供追溯，但不得据此声称能力存在）：
+
+| 条目 | 作废原因 |
+| --- | --- |
+| `1.3` | 冻结的 `command envelope` / `params digest` 命令载体已取消 |
+| `1.4` | 冻结的 `lock namespace` / workspace 归属已取消（改 session 租约） |
+| `2.3` | 「root owner 申请」已取消（改 session 租约） |
+| `2.6` | 「params digest 冲突拒绝 + 一个 owner」已取消（幂等只由 `runs` 唯一约束承担） |
+| `2.8` | `owner.reconcile` 已取消（崩溃恢复自动分类，不需要人工介入） |
+| `3.1` | `workspace_lock.py` 已删除 |
+| `4.1` | 「owner 表」已取消（保留 `runs.owner_pid` 供恢复归属） |
+| `4.2` | 「command accepted 原子事务」中命令台账部分已取消（run 行提交仍是 dispatch 屏障） |
+| `4.3` | RFC 8785/JCS 全条已取消（改普通 canonical JSON） |
+| `6.2` | 「command idempotency」中的命令台账部分已取消 |
+| `6.6` | 其中与 owner/quarantine 相关的断言作废 |
+
+**新增/改写的条目**见 §3（session 租约）与 §6（真实 session 互斥用例）。
+
 ## 1. C03 变更准备与证据身份
 
 - [x] 1.1 记录当前 checkout、branch、HEAD、Python `>=3.11`、OpenSpec 版本和唯一 writer；以 `git status --short --branch`、`git rev-parse HEAD` 和 `python --version` 验证身份可复算，并记录 C02 已知 flake、重复次数和 retained 判据
 - [x] 1.2 读取并冻结 `openspec/changes/decouple-runtime-interaction-from-tui/tasks.md §6.2` 的 `OutputPort`、`InteractionPort`、`InteractionRegistry`、`RuntimeEventEmitter`、`DurableToolBoundary` 和 `SQLiteRuntimeStore` 接口；若段落缺失则以当前公开模块核对并记录；以 C02 focused regression 验证不重写 canonical 事实源
-- [x] 1.3 冻结 command envelope、scope、params digest、状态转移、错误码、终态唯一和 cancel generation；以 Application API schema/transition tests 验证每个字段与状态均有 oracle
-- [x] 1.4 冻结 control DB、canonical store、lock namespace、workspace 归属和 migration schema；以临时目录 schema/锁竞争实验验证路径、版本和旧数据只读兼容
+- [x] 1.3 ~~（v3 作废）~~ 冻结 command envelope、scope、params digest、状态转移、错误码、终态唯一和 cancel generation；以 Application API schema/transition tests 验证每个字段与状态均有 oracle
+- [x] 1.4 ~~（v3 作废）~~ 冻结 control DB、canonical store、lock namespace、workspace 归属和 migration schema；以临时目录 schema/锁竞争实验验证路径、版本和旧数据只读兼容
 - [x] 1.5 建立 mock、离线 provider/worker、真实本地 Python subprocess、真实 CLI/TUI consumer 与 Harbor 只读契约的证据分层；以证据 manifest 验证每个测试标注 actor 类型、命令、退出码和路径
 - [x] 1.6 完成独立 openspec-designer 与 test-strategy-agent 的“对科学审查”，逐条核对 P0/P1 缺口；以两份带 result_identity 的审查报告和主 Agent 复核记录验证 D(C03) 前置
 

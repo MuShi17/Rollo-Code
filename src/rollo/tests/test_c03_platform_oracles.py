@@ -4,10 +4,13 @@ Two mutants survived the whole suite before this file existed:
 
 * ``_windows_process_alive`` replaced by ``return False`` — every existing case
   short-circuits on ``pid == os.getpid()`` and never reaches the Windows API;
-* dropping the ``commands`` primary key / ``runs`` uniqueness constraint — no
-  test ever inspected the control schema.
+* dropping the durable idempotency/exclusion keys — no test ever inspected the
+  control schema.
 
-Both are pinned here.
+Both are pinned here.  Under v3 the schema keys are ``runs(session_id,
+command_id)`` (command idempotency) and ``session_leases.session_id`` (the only
+execution mutex); the v2 ``owners``/``commands``/``tool_operations`` tables must
+not come back.
 """
 
 from __future__ import annotations
@@ -53,20 +56,24 @@ def test_windows_process_alive_sees_a_terminated_process_as_dead():
         assert _process_alive(bogus) is False
 
 
-def test_control_schema_enforces_command_uniqueness(tmp_path: Path):
+def test_control_schema_enforces_run_and_lease_uniqueness(tmp_path: Path):
     """The durable idempotency keys must exist, not just the application logic."""
+
+    import sqlite3
 
     context = ProjectContext.from_root(tmp_path, runtime_data_dir=tmp_path / "runtime")
     store = ControlStore(
         context.runtime_data_dir / "application" / context.workspace_id / "control.sqlite"
     )
+    now = "2026-01-01T00:00:00.000Z"
     try:
-        commands_sql = str(
-            store.connection.execute(
-                "SELECT sql FROM sqlite_master WHERE type='table' AND name='commands'"
-            ).fetchone()[0]
-        ).lower().replace(" ", "")
-        assert "primarykey(scope_type,scope_id,command_id)" in commands_sql, commands_sql
+        tables = {
+            str(row["name"])
+            for row in store.connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        assert {"owners", "commands", "tool_operations"}.isdisjoint(tables), tables
 
         runs_sql = str(
             store.connection.execute(
@@ -75,85 +82,92 @@ def test_control_schema_enforces_command_uniqueness(tmp_path: Path):
         ).lower().replace(" ", "")
         assert "unique(session_id,command_id)" in runs_sql, runs_sql
 
-        # And the constraint must actually bite: a duplicate command row with a
-        # different digest can never be stored.
-        import sqlite3
+        lease_rows = list(store.connection.execute("PRAGMA table_info(session_leases)"))
+        lease_columns = {str(row["name"]) for row in lease_rows}
+        assert "pid" in lease_columns, lease_columns
+        assert "process_id" not in lease_columns, lease_columns
+        assert [str(row["name"]) for row in lease_rows if int(row["pk"]) == 1] == ["session_id"]
 
-        now = "2026-01-01T00:00:00.000Z"
+        # And the constraints must actually bite: a second run row for the same
+        # (session_id, command_id) can never be stored.
         store.connection.execute(
-            "INSERT INTO commands(scope_type,scope_id,command_id,operation,params_digest,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
-            ("session", "s", "c", "run.start", "d1", "accepted", now, now),
+            "INSERT INTO runs(run_id,session_id,workspace_id,command_id,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+            ("run-1", "s", "w", "c", "queued", now, now),
         )
         with pytest.raises(sqlite3.IntegrityError):
             store.connection.execute(
-                "INSERT INTO commands(scope_type,scope_id,command_id,operation,params_digest,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
-                ("session", "s", "c", "run.start", "d2", "accepted", now, now),
+                "INSERT INTO runs(run_id,session_id,workspace_id,command_id,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+                ("run-2", "s", "w", "c", "queued", now, now),
+            )
+
+        store.connection.execute(
+            "INSERT INTO session_leases(session_id,workspace_id,owner_id,pid,acquired_at,updated_at) VALUES(?,?,?,?,?,?)",
+            ("s", "w", "owner-1", 1, now, now),
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            store.connection.execute(
+                "INSERT INTO session_leases(session_id,workspace_id,owner_id,pid,acquired_at,updated_at) VALUES(?,?,?,?,?,?)",
+                ("s", "w", "owner-2", 2, now, now),
             )
     finally:
         store.close()
 
 
-def test_owner_capability_fast_path_rechecks_quarantine(tmp_path: Path):
-    """P1-3: holding the capability must not skip the quarantine re-check.
+def test_session_lease_blocks_a_second_holder_but_not_other_sessions(tmp_path: Path):
+    """The unit of execution exclusion is the session, never the workspace.
 
-    The branch is unreachable through ``run_start`` (a live task is refused with
-    ``owner_conflict`` first, and ``_release_owner`` clears the lock once the
-    last task finishes), so this drives ``_acquire_root_owner`` directly with the
-    capability held.  It still has no mutation discrimination — that is a
-    property of the branch being dead defensive code, not of the assertion — and
-    the round-2 review confirmed the unreachability argument.
+    A lease held by a *live* foreign process refuses; a different session of the
+    same workspace is untouched; a lease whose holder is gone is adopted; and a
+    stale release can never delete a newer holder's row.
     """
 
-    import asyncio
+    context = ProjectContext.from_root(tmp_path, runtime_data_dir=tmp_path / "runtime")
+    store = ControlStore(
+        context.runtime_data_dir / "application" / context.workspace_id / "control.sqlite"
+    )
+    holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+    now = "2026-01-01T00:00:00.000Z"
+    try:
+        assert store.acquire_session_lease(
+            session_id="session-a", workspace_id=context.workspace_id, owner_id="owner-self"
+        ) is None
+        assert int(store.session_lease("session-a")["pid"]) == os.getpid()
 
-    from rollo.application import Application, WorkspaceLock, workspace_lock_key
+        # A live foreign holder refuses and its identity is reported back.
+        store.connection.execute(
+            "UPDATE session_leases SET owner_id=?,pid=? WHERE session_id=?",
+            ("owner-foreign", holder.pid, "session-a"),
+        )
+        assert store.acquire_session_lease(
+            session_id="session-a", workspace_id=context.workspace_id, owner_id="owner-b"
+        ) == "owner-foreign"
+        assert store.session_lease("session-a")["owner_id"] == "owner-foreign"
 
-    async def scenario():
-        context = ProjectContext.from_root(tmp_path, runtime_data_dir=tmp_path / "runtime")
-        app = Application(context, agent_factory=lambda **kwargs: None)
-        try:
-            # Simulate "this root already holds the workspace capability".
-            lock_path = (
-                context.runtime_data_dir
-                / "application"
-                / context.workspace_id
-                / "locks"
-                / f"{workspace_lock_key(context.workspace_id)}.lock"
-            )
-            app._owner_lock = WorkspaceLock(
-                lock_path, workspace_id=context.workspace_id, owner_id="owner-self"
-            ).acquire()
-            app.owner_id = "owner-self"
+        # A different session of the same workspace is not blocked.
+        assert store.acquire_session_lease(
+            session_id="session-b", workspace_id=context.workspace_id, owner_id="owner-b"
+        ) is None
+        assert store.session_lease("session-b")["owner_id"] == "owner-b"
 
-            # Baseline: with no other owner row the fast path lets work through.
-            assert app._acquire_root_owner() is None
+        # A release from a non-holder must not evict the live holder.
+        store.release_session_lease("session-a")
+        assert store.session_lease("session-a")["owner_id"] == "owner-foreign"
 
-            store = ControlStore(
-                context.runtime_data_dir
-                / "application"
-                / context.workspace_id
-                / "control.sqlite"
-            )
-            try:
-                store.insert_owner(
-                    owner_id="owner-stale",
-                    workspace_id=context.workspace_id,
-                    generation=99,
-                    lock_key="stale",
-                )
-                store.update_owner("owner-stale", status="uncertain", quarantine=1)
-            finally:
-                store.close()
+        # Once the holder is gone the lease is stale evidence, not a lock.
+        holder.kill()
+        holder.wait(timeout=30)
+        assert store.acquire_session_lease(
+            session_id="session-a", workspace_id=context.workspace_id, owner_id="owner-b"
+        ) is None
+        assert store.session_lease("session-a")["owner_id"] == "owner-b"
 
-            blocked = app._acquire_root_owner()
-            assert blocked is not None, "a quarantined owner must block a live root"
-            assert blocked.error_code == "owner_quarantine", blocked
-            assert blocked.data["owner_id"] == "owner-stale", blocked
-        finally:
-            app.owner_id = None
-            if app._owner_lock is not None:
-                app._owner_lock.release()
-                app._owner_lock = None
-            await app.shutdown()
+        # And the holder can always release its own lease.
+        store.release_session_lease("session-a")
+        assert store.session_lease("session-a") is None
+        assert store.session_lease("session-b") is not None
+    finally:
+        if holder.poll() is None:
+            holder.kill()
+            holder.wait(timeout=30)
+        store.close()
 
-    asyncio.run(scenario())

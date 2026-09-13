@@ -6,7 +6,16 @@ import math
 import sys
 from pathlib import Path
 
-from rollo.application import Application, ControlStore, canonical_json_bytes, params_digest, project_canonical_evidence
+import pytest
+
+from rollo.application import (
+    Application,
+    ControlStore,
+    canonical_json_bytes,
+    full_sha256,
+    params_digest,
+    project_canonical_evidence,
+)
 from rollo.interactions import InteractionKind, InteractionRegistry, InteractionRequest
 from rollo.project_context import ProjectContext
 
@@ -80,17 +89,21 @@ def test_run_start_control_commit_failure_never_dispatches(tmp_path: Path):
         context = ProjectContext.from_root(tmp_path, runtime_data_dir=tmp_path / "runtime")
         app = Application(context, agent_factory=_FakeAgent)
         session = app.session_create("session-fault").session_id
-        original = app.control.insert_run_and_command
+        original = app.control.insert_run
 
         def fail(*args, **kwargs):
             raise RuntimeError("injected commit failure")
 
-        app.control.insert_run_and_command = fail  # type: ignore[method-assign]
+        app.control.insert_run = fail  # type: ignore[method-assign]
         response = await app.run_start(session_id=session, prompt="never dispatch", command_id="cmd-fault")
         assert response.error_code == "control_commit_error"
         assert not app._tasks
-        assert app.owner_id is None
-        app.control.insert_run_and_command = original  # type: ignore[method-assign]
+        # The failure is still before the dispatch barrier, so the session
+        # lease taken for this command must be handed back for a later retry.
+        assert app._session_leases == set()
+        assert app.control.session_lease(session) is None
+        assert app.control.run_for_command(session, "cmd-fault") is None
+        app.control.insert_run = original  # type: ignore[method-assign]
         await app.shutdown()
 
     asyncio.run(scenario())
@@ -206,19 +219,34 @@ def test_application_digest_is_full_sha256():
     assert digest == digest.lower()
 
 
-def test_c03_jcs_vectors_reject_non_finite_numbers():
-    assert canonical_json_bytes({"b": 1.0, "a": -0.0}) == b'{"a":0,"b":1}'
-    assert canonical_json_bytes(1e20) == b"100000000000000000000"
-    assert canonical_json_bytes(1e21) == b"1e+21"
-    assert canonical_json_bytes(1e-6) == b"0.000001"
-    assert canonical_json_bytes(1e-7) == b"1e-7"
+def test_canonical_json_bytes_is_plain_canonical_json():
+    """v3 digests hash plain canonical JSON, not RFC 8785 JCS.
+
+    Sorted keys, no insignificant whitespace and verbatim UTF-8 are the whole
+    contract now; number spelling follows ``json.dumps`` (so ``1e20`` stays
+    ``1e+20`` instead of being expanded to an integer literal).  Non-finite
+    numbers stay rejected: emitting bare ``NaN``/``Infinity`` would write
+    invalid JSON into the control records and let an unreproducible value into
+    an approval digest.
+    """
+
+    assert canonical_json_bytes({"b": 1, "a": 2}) == b'{"a":2,"b":1}'
+    assert canonical_json_bytes({"k": "中文"}) == '{"k":"中文"}'.encode("utf-8")
+    assert canonical_json_bytes([1, {"z": [True, None]}, "a"]) == b'[1,{"z":[true,null]},"a"]'
+    assert canonical_json_bytes(1e20) == b"1e+20"
     for value in (math.nan, math.inf, -math.inf):
-        try:
+        with pytest.raises(ValueError):
             canonical_json_bytes(value)
-        except ValueError:
-            pass
-        else:
-            raise AssertionError("non-finite number was accepted by JCS")
+    with pytest.raises(ValueError):
+        canonical_json_bytes({"nested": [math.nan]})
+    assert full_sha256({"a": 1}) == hashlib.sha256(b'{"a":1}').hexdigest()
+    assert params_digest(
+        session_id="s", run_id="r", request_id=None, tool_call_id=None,
+        tool_name=None, tool_input=None, plan_id=None,
+    ) == full_sha256({
+        "session_id": "s", "run_id": "r", "request_id": None, "tool_call_id": None,
+        "tool_name": None, "tool_input": None, "plan_id": None, "plan_digest": None,
+    })
 
 
 def test_projection_pairs_multiple_tool_operations_and_detects_identity_faults():

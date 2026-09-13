@@ -6,6 +6,6 @@ __version__ = "0.1.0"
 # ``from rollo import Application`` useful without forcing callers to know the
 # module layout; the implementation itself still requires an explicit
 # ProjectContext at construction time.
-from .application import Application, ApplicationResponse, CommandEnvelope  # noqa: E402,F401
+from .application import Application, ApplicationResponse  # noqa: E402,F401
 
-__all__ = ["Application", "ApplicationResponse", "CommandEnvelope", "__version__"]
+__all__ = ["Application", "ApplicationResponse", "__version__"]
