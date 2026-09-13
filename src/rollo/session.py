@@ -41,21 +41,32 @@ def _ensure_dir() -> None:
     SESSION_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def _session_dir(session_id: str) -> Path:
-    return SESSION_DIR / session_id
+def _session_dir(session_id: str, *, context: Any | None = None, runtime_root: Path | None = None) -> Path:
+    if context is not None:
+        base = Path(context.runtime_data_dir) / "sessions"
+    elif runtime_root is not None:
+        base = Path(runtime_root) / "sessions"
+    else:
+        base = SESSION_DIR
+    return base / session_id
 
 
-def runtime_store_path(session_id: str) -> Path:
+def runtime_store_path(
+    session_id: str,
+    *,
+    context: Any | None = None,
+    runtime_root: Path | None = None,
+) -> Path:
     """Return the canonical store path isolated to one session directory."""
 
     if not isinstance(session_id, str) or not session_id.strip():
         raise ValueError("session_id must be a non-empty string")
     if Path(session_id).name != session_id or session_id in {".", ".."}:
         raise ValueError("session_id must be a single safe path component")
-    return _session_dir(session_id) / "runtime.sqlite"
+    return _session_dir(session_id, context=context, runtime_root=runtime_root) / "runtime.sqlite"
 
 
-def list_runtime_store_paths() -> list[Path]:
+def list_runtime_store_paths(*, context: Any | None = None, runtime_root: Path | None = None) -> list[Path]:
     """List only session-scoped canonical stores.
 
     A root-level database may still exist from an older installation, but it
@@ -63,9 +74,10 @@ def list_runtime_store_paths() -> list[Path]:
     older formats remain untouched and are not candidates for list/latest/resume.
     """
 
+    session_root = _session_dir("_placeholder", context=context, runtime_root=runtime_root).parent
     paths = [
-        path for path in SESSION_DIR.glob("*/runtime.sqlite") if path.is_file()
-    ] if SESSION_DIR.exists() else []
+        path for path in session_root.glob("*/runtime.sqlite") if path.is_file()
+    ] if session_root.exists() else []
     return sorted(
         paths,
         key=lambda path: (path.stat().st_mtime_ns, str(path)),
@@ -73,8 +85,8 @@ def list_runtime_store_paths() -> list[Path]:
     )
 
 
-def _session_v2_path(session_id: str) -> Path:
-    return _session_dir(session_id) / "session.v2.json"
+def _session_v2_path(session_id: str, *, context: Any | None = None, runtime_root: Path | None = None) -> Path:
+    return _session_dir(session_id, context=context, runtime_root=runtime_root) / "session.v2.json"
 
 
 def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
@@ -99,6 +111,7 @@ def build_session_v2(
     runtime_store: Any,
     *,
     high_water: int | None = None,
+    context: Any | None = None,
 ) -> dict[str, Any] | None:
     """Build a canonical-derived v2 snapshot from one immutable prefix."""
 
@@ -149,11 +162,12 @@ def save_session_v2(
     runtime_store: Any,
     *,
     high_water: int | None = None,
+    context: Any | None = None,
 ) -> dict[str, Any] | None:
-    snapshot = build_session_v2(session_id, runtime_store, high_water=high_water)
+    snapshot = build_session_v2(session_id, runtime_store, high_water=high_water, context=context)
     if snapshot is not None:
         _ensure_dir()
-        _atomic_write_json(_session_v2_path(session_id), snapshot)
+        _atomic_write_json(_session_v2_path(session_id, context=context), snapshot)
     return snapshot
 
 
@@ -177,11 +191,12 @@ def load_session(
     session_id: str,
     *,
     runtime_store: Any | None = None,
+    context: Any | None = None,
 ) -> dict[str, Any] | None:
     """Load a canonical-derived session view, rebuilding its cache as needed."""
     owned_store = None
     if runtime_store is None:
-        database = runtime_store_path(session_id)
+        database = runtime_store_path(session_id, context=context)
         if not database.is_file():
             return None
         from .runtime_store import SQLiteRuntimeStore
@@ -207,12 +222,12 @@ def load_session(
             owned_store.close()
 
 
-def list_sessions(runtime_store: Any | None = None) -> list[dict[str, Any]]:
+def list_sessions(runtime_store: Any | None = None, *, context: Any | None = None) -> list[dict[str, Any]]:
     """List sessions represented by canonical SQLite ledgers only."""
 
     if runtime_store is not None:
         return list_canonical_sessions(runtime_store)
-    return list_canonical_runtime_sessions()
+    return list_canonical_runtime_sessions(context=context)
 
 
 def list_canonical_sessions(runtime_store: Any) -> list[dict[str, Any]]:
@@ -226,13 +241,13 @@ def list_canonical_sessions(runtime_store: Any) -> list[dict[str, Any]]:
     return result
 
 
-def list_canonical_runtime_sessions() -> list[dict[str, Any]]:
+def list_canonical_runtime_sessions(*, context: Any | None = None) -> list[dict[str, Any]]:
     """Inspect all session stores for CLI list/latest without mutating them."""
 
     from .runtime_store import SQLiteRuntimeStore
 
     result: list[dict[str, Any]] = []
-    for database in list_runtime_store_paths():
+    for database in list_runtime_store_paths(context=context):
         store: Any | None = None
         try:
             store = SQLiteRuntimeStore(database)

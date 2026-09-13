@@ -1,0 +1,254 @@
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import math
+import sys
+from pathlib import Path
+
+from rollo.application import Application, ControlStore, canonical_json_bytes, params_digest, project_canonical_evidence
+from rollo.interactions import InteractionKind, InteractionRegistry, InteractionRequest
+from rollo.project_context import ProjectContext
+
+
+class _FakeAgent:
+    instances: list["_FakeAgent"] = []
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.interaction_registry = InteractionRegistry()
+        self.interaction_port = kwargs.get("interaction_port")
+        self.aborted = False
+        self.__class__.instances.append(self)
+
+    def set_interaction_port(self, port):
+        self.interaction_port = port
+
+    async def chat(self, prompt: str):
+        if prompt == "wait":
+            request = InteractionRequest(
+                request_id="request-1",
+                kind=InteractionKind.APPROVAL,
+                session_id=self.kwargs["runtime_session_id"],
+                run_id=self.kwargs["runtime_run_id"],
+                params_digest="digest",
+                tool_call_id=None,
+                tool_name=None,
+            )
+            self.interaction_registry.open(request)
+            await self.interaction_port.request(request)
+
+    def abort(self):
+        self.aborted = True
+
+    async def aclose(self):
+        return None
+
+
+def test_application_workspace_session_and_idempotent_run(tmp_path: Path):
+    async def scenario():
+        context = ProjectContext.from_root(tmp_path, runtime_data_dir=tmp_path / "runtime")
+        app = Application(context, agent_factory=_FakeAgent)
+        session = app.session_create("session-a").session_id
+        first = await app.run_start(session_id=session, prompt="hello", command_id="cmd-1")
+        second = await app.run_start(session_id=session, prompt="hello", command_id="cmd-1")
+        assert first.run_id == second.run_id
+        assert (await app.wait_run(first.run_id)).status == "succeeded"
+        assert len(app.session_list().data["sessions"]) == 1
+        await app.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_application_reuses_existing_agent_across_repl_runs(tmp_path: Path):
+    async def scenario():
+        context = ProjectContext.from_root(tmp_path, runtime_data_dir=tmp_path / "runtime")
+        agent = _FakeAgent(runtime_session_id="session-reuse", runtime_run_id="unused")
+        app = Application(context, existing_agent=agent)
+        session = app.session_create("session-reuse").session_id
+        first = await app.run_start(session_id=session, prompt="one", command_id="cmd-reuse-1")
+        assert (await app.wait_run(first.run_id)).status == "succeeded"
+        second = await app.run_start(session_id=session, prompt="two", command_id="cmd-reuse-2")
+        assert (await app.wait_run(second.run_id)).status == "succeeded"
+        await app.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_run_start_control_commit_failure_never_dispatches(tmp_path: Path):
+    async def scenario():
+        context = ProjectContext.from_root(tmp_path, runtime_data_dir=tmp_path / "runtime")
+        app = Application(context, agent_factory=_FakeAgent)
+        session = app.session_create("session-fault").session_id
+        original = app.control.insert_run_and_command
+
+        def fail(*args, **kwargs):
+            raise RuntimeError("injected commit failure")
+
+        app.control.insert_run_and_command = fail  # type: ignore[method-assign]
+        response = await app.run_start(session_id=session, prompt="never dispatch", command_id="cmd-fault")
+        assert response.error_code == "control_commit_error"
+        assert not app._tasks
+        assert app.owner_id is None
+        app.control.insert_run_and_command = original  # type: ignore[method-assign]
+        await app.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_plan_approval_uses_application_identity_metadata(tmp_path: Path):
+    async def scenario():
+        from rollo.agent import Agent
+        from rollo.interactions import InteractionReply
+
+        context = ProjectContext.from_root(tmp_path, runtime_data_dir=tmp_path / "runtime")
+        seen = {}
+
+        class Approver:
+            async def request(self, request):
+                seen["request"] = request
+                return InteractionReply(
+                    request_id=request.request_id,
+                    approved=True,
+                    params_digest=request.params_digest,
+                )
+
+        agent = Agent(project_context=context, api_key="fixture-key", interaction_port=Approver())
+        agent.configure_application_interactions(True)
+        agent.permission_mode = "plan"
+        result = await agent._execute_plan_mode_tool("exit_plan_mode")
+        assert "approved" in result.lower()
+        request = seen["request"]
+        assert request.metadata == {"plan_approval": True}
+        assert request.tool_name == "plan_approval"
+        assert request.plan_digest and len(request.plan_digest) == 64
+        await agent.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_control_pending_redacts_sensitive_input(tmp_path: Path):
+    store = ControlStore(tmp_path / "control.sqlite")
+    request = InteractionRequest(
+        request_id="secret-request",
+        kind=InteractionKind.APPROVAL,
+        session_id="s",
+        run_id="r",
+        params_digest="d",
+        tool_input={"api_key": "secret-value", "nested": {"password": "pw"}},
+    )
+    store.insert_pending(request, workspace_id="w", process_id=1)
+    raw = str(store.pending("secret-request")["tool_input_json"])
+    assert "secret-value" not in raw and "pw" not in raw
+    assert "[REDACTED]" in raw
+    store.close()
+
+
+def test_application_interaction_response_is_bound_and_resolves_once(tmp_path: Path):
+    async def scenario():
+        context = ProjectContext.from_root(tmp_path, runtime_data_dir=tmp_path / "runtime")
+        
+        class HoldingPort:
+            async def request(self, request):
+                await asyncio.Event().wait()
+
+        app = Application(context, agent_factory=_FakeAgent, interaction_port=HoldingPort())
+        session = app.session_create("session-b").session_id
+        started = await app.run_start(session_id=session, prompt="wait", command_id="cmd-2")
+        for _ in range(100):
+            if app.control.pending("request-1") is not None:
+                break
+            await asyncio.sleep(0.005)
+        reply = await app.interaction_respond(
+            request_id="request-1",
+            session_id=session,
+            run_id=started.run_id,
+            tool_call_id=None,
+            tool_name=None,
+            tool_input=None,
+            plan_id=None,
+            plan_digest=None,
+            params_digest="digest",
+            approved=True,
+        )
+        assert reply.status == "resolved"
+        assert (await app.wait_run(started.run_id)).status == "succeeded"
+        late = await app.interaction_respond(
+            request_id="request-1",
+            session_id=session,
+            run_id=started.run_id,
+            tool_call_id=None,
+            tool_name=None,
+            tool_input=None,
+            plan_id=None,
+            plan_digest=None,
+            params_digest="digest",
+            approved=True,
+        )
+        assert late.error_code in {"interaction_interrupted", "interaction_binding_error"}
+        await app.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_application_digest_is_full_sha256():
+    digest = params_digest(
+        session_id="s",
+        run_id="r",
+        request_id="q",
+        tool_call_id=None,
+        tool_name=None,
+        tool_input=None,
+        plan_id=None,
+        plan_digest_value=None,
+    )
+    assert len(digest) == 64
+    assert digest == digest.lower()
+
+
+def test_c03_jcs_vectors_reject_non_finite_numbers():
+    assert canonical_json_bytes({"b": 1.0, "a": -0.0}) == b'{"a":0,"b":1}'
+    assert canonical_json_bytes(1e20) == b"100000000000000000000"
+    assert canonical_json_bytes(1e21) == b"1e+21"
+    assert canonical_json_bytes(1e-6) == b"0.000001"
+    assert canonical_json_bytes(1e-7) == b"1e-7"
+    for value in (math.nan, math.inf, -math.inf):
+        try:
+            canonical_json_bytes(value)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("non-finite number was accepted by JCS")
+
+
+def test_projection_pairs_multiple_tool_operations_and_detects_identity_faults():
+    def event(actions=None, *, status=None, invocation="i", turn="t"):
+        return {
+            "session_id": "s",
+            "run_id": "r",
+            "invocation_id": invocation,
+            "turn_id": turn,
+            "actions": actions or {},
+            "status": status,
+        }
+
+    dispatch_a = {"operation_id": "op-a", "provider_tool_call_id": "tc-a", "tool_name": "read_file", "canonical_args_hash": "ha"}
+    dispatch_b = {"operation_id": "op-b", "provider_tool_call_id": "tc-b", "tool_name": "run_shell", "canonical_args_hash": "hb"}
+    events = [
+        event({"tool_dispatch": dispatch_a}),
+        event({"tool_dispatch": dispatch_b}),
+        event({"tool_outcome": {**dispatch_a, "success": True, "executed": True}}),
+        event({"tool_outcome": {**dispatch_b, "success": True, "executed": True}}, status="completed"),
+    ]
+    projected = project_canonical_evidence(events, session_id="s", run_id="r", side_effect_count=2)
+    assert projected.status == "succeeded"
+    assert [item["operation_id"] for item in projected.correlation["tool_operations"]] == ["op-a", "op-b"]
+    assert projected.side_effect_count == 2
+
+    missing = project_canonical_evidence([event({"tool_dispatch": {"operation_id": "op"}})], session_id="s", run_id="r", side_effect_count=9)
+    assert (missing.status, missing.error_code, missing.side_effect_count) == ("uncertain", "canonical_identity_missing", 0)
+    conflict = project_canonical_evidence(
+        [event({"tool_dispatch": dispatch_a}), event({"tool_dispatch": {**dispatch_a, "tool_name": "write_file"}})],
+        session_id="s", run_id="r", side_effect_count=1,
+    )
+    assert (conflict.status, conflict.error_code, conflict.side_effect_count) == ("uncertain", "canonical_identity_conflict", 1)

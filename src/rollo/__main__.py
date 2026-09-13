@@ -7,12 +7,16 @@ import asyncio
 import os
 import signal
 import sys
+import uuid
 from pathlib import Path
 from dotenv import load_dotenv
 load_dotenv()
 from .agent import Agent, DEFAULT_THINKING_EFFORT
+from .application import Application
 from .project_context import ProjectContext, ProjectContextError, WorkspaceNotFoundError
 from .runtime_ports import set_diagnostic_sink
+from .runtime_ports import NullOutputPort
+from .interactions import DenyingInteractionPort
 from .tui_adapter import TerminalInteractionPort, TerminalOutputPort
 from .ui import print_welcome, print_user_prompt, print_error, print_info, print_plan_for_approval, print_plan_approval_options, print_diagnostic
 from .session import (
@@ -22,6 +26,7 @@ from .session import (
     list_runtime_store_paths,
     load_session,
     runtime_data_dir,
+    runtime_store_path,
 )
 from .runtime_store import SQLiteRuntimeStore
 from .recovery import RecoveryProjection
@@ -121,13 +126,38 @@ def _open_latest_canonical_store() -> tuple[SQLiteRuntimeStore | None, str | Non
     return selected, session_id
 
 
-async def run_repl(agent: Agent) -> None:
+async def run_repl(agent: Agent, *, application: Application | None = None) -> None:
     """Interactive REPL loop."""
 
     # 终端交互统一经适配器：阻塞 input 在独立线程中执行、不阻塞事件循环，
     # 且取消可以解除等待。**不再注册 `confirm_fn`** —— 它内部的同步 input
     # 会优先于端口，使端口收不到任何请求（复核 N-12）。
-    agent.set_interaction_port(TerminalInteractionPort())
+    terminal_port = TerminalInteractionPort()
+    agent.set_interaction_port(terminal_port)
+    if application is not None:
+        # The REPL owns the concrete terminal adapter; the Application remains
+        # the lifecycle boundary and receives that adapter explicitly.
+        application.interaction_port = terminal_port
+
+    active_run_id: str | None = None
+
+    async def application_chat(prompt: str) -> None:
+        nonlocal active_run_id
+        if application is None:
+            await agent.chat(prompt)
+            return
+        started = await application.run_start(
+            session_id=agent.session_id,
+            prompt=prompt,
+            command_id=f"repl-{agent.session_id}-{uuid.uuid4().hex}",
+        )
+        if started.error_code:
+            raise RuntimeError(started.error_code)
+        active_run_id = started.run_id
+        try:
+            await application.wait_run(started.run_id or "")
+        finally:
+            active_run_id = None
 
     async def plan_approval_fn(plan_content: str) -> dict:
         print_plan_for_approval(plan_content)
@@ -158,9 +188,17 @@ async def run_repl(agent: Agent) -> None:
 
     def handle_sigint(sig, frame):
         nonlocal sigint_count
-        if agent._aborted is False and agent._output_buffer is not None:
+        if agent.is_processing:
             # Agent is processing
-            agent.abort()
+            if application is not None and active_run_id is not None:
+                asyncio.create_task(
+                    application.run_cancel(
+                        run_id=active_run_id,
+                        command_id=f"repl-cancel-{uuid.uuid4().hex}",
+                    )
+                )
+            else:
+                agent.abort()
             print("\n  (interrupted)")
             sigint_count = 0
             print_user_prompt()
@@ -240,10 +278,10 @@ async def run_repl(agent: Agent) -> None:
                     if skill.context == "fork":
                         result = execute_skill(skill.name, cmd_args, agent.context)
                         if result:
-                            await agent.chat(f'Use the skill tool to invoke "{skill.name}" with args: {cmd_args or "(none)"}')
+                            await application_chat(f'Use the skill tool to invoke "{skill.name}" with args: {cmd_args or "(none)"}')
                     else:
                         resolved = resolve_skill_prompt(skill, cmd_args)
-                        await agent.chat(resolved)
+                        await application_chat(resolved)
                 except Exception as e:
                     if "abort" not in str(e).lower():
                         print_error(str(e))
@@ -251,7 +289,7 @@ async def run_repl(agent: Agent) -> None:
 
         # Normal chat
         try:
-            await agent.chat(inp)
+            await application_chat(inp)
         except Exception as e:
             if "abort" not in str(e).lower():
                 print_error(str(e))
@@ -260,6 +298,26 @@ async def run_repl(agent: Agent) -> None:
 async def _run_repl_with_cleanup(agent: Agent) -> None:
     """Run the REPL and close Agent-owned resources on every exit path."""
 
+    if hasattr(agent, "session_id") and hasattr(agent, "configure_application_interactions"):
+        context = agent.context
+        if getattr(agent, "_runtime_store", None) is None and hasattr(agent, "configure_runtime_store"):
+            agent.configure_runtime_store(SQLiteRuntimeStore(runtime_store_path(agent.session_id, context=context)))
+        application = Application(
+            context,
+            output_port=getattr(agent, "output_port", NullOutputPort()),
+            interaction_port=getattr(agent, "interaction_port", DenyingInteractionPort()),
+            existing_agent=agent,
+        )
+        # The canonical runtime file may already exist for this CLI-created
+        # session.  Registering the explicit session in the C03 control index
+        # is the deliberate migration boundary; it is not implicit adoption
+        # of an arbitrary inspect-only legacy database.
+        application.session_create(agent.session_id)
+        try:
+            await run_repl(agent, application=application)
+        finally:
+            await application.shutdown()
+        return
     try:
         await run_repl(agent)
     finally:
@@ -273,6 +331,48 @@ async def _run_one_shot(agent: Agent, prompt: str) -> None:
         await agent.chat(prompt)
     finally:
         await agent.aclose()
+
+
+async def _run_application_one_shot(agent: Agent, context: ProjectContext, prompt: str) -> None:
+    """Run one-shot through the public Application boundary."""
+
+    # Keep lightweight embedding/test doubles compatible with the historical
+    # CLI seam; real Agent instances expose the C03 identity configuration API.
+    if not hasattr(agent, "session_id") or not hasattr(agent, "configure_application_interactions"):
+        await agent.chat(prompt)
+        close = getattr(agent, "aclose", None)
+        if close is not None:
+            result = close()
+            if hasattr(result, "__await__"):
+                await result
+        return
+
+    if getattr(agent, "_runtime_store", None) is None and hasattr(agent, "configure_runtime_store"):
+        # Preserve the CLI's legacy SESSION_DIR override used by offline
+        # consumers; the Application itself still receives an explicit store.
+        agent.configure_runtime_store(SQLiteRuntimeStore(runtime_store_path(agent.session_id)))
+
+    app = Application(
+        context,
+        output_port=getattr(agent, "output_port", NullOutputPort()),
+        interaction_port=getattr(agent, "interaction_port", DenyingInteractionPort()),
+        existing_agent=agent,
+    )
+    try:
+        application_session = app.session_create(agent.session_id)
+        if application_session.error_code:
+            raise RuntimeError(application_session.error_code)
+        started = await app.run_start(session_id=agent.session_id, prompt=prompt, command_id=f"cli-{agent.session_id}-{os.getpid()}-{uuid.uuid4().hex}")
+        # A rejected run.start (quarantined/foreign owner, digest conflict, ...)
+        # must fail loudly.  Waiting on an empty run id would otherwise exit 0
+        # with no output, which is indistinguishable from a successful run.
+        if started.error_code:
+            raise RuntimeError(
+                f"run.start rejected: {started.error_code} ({started.status})"
+            )
+        await app.wait_run(started.run_id or "")
+    finally:
+        await app.shutdown()
 
 
 def _entry_workspace() -> Path:
@@ -500,7 +600,7 @@ Examples:
         if prompt:
             # One-shot mode
             try:
-                asyncio.run(_run_one_shot(agent, prompt))
+                asyncio.run(_run_application_one_shot(agent, project_context, prompt))
             except Exception as e:
                 print_error(str(e))
                 sys.exit(1)

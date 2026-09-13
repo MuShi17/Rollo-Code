@@ -96,7 +96,12 @@ class InteractionRequest:
     prompt: str = ""
     tool_call_id: str | None = None
     tool_name: str | None = None
-    expires_at: float | None = None
+    tool_input: Any = None
+    plan_id: str | None = None
+    plan_digest: str | None = None
+    expires_at: float | str | None = None
+    expires_at_utc: str | None = None
+    metadata: Mapping[str, Any] | None = None
     created_at: float = field(default_factory=time.monotonic)
 
     def __post_init__(self) -> None:
@@ -110,6 +115,11 @@ class InteractionRequest:
     def is_expired(self, now: float | None = None) -> bool:
         if self.expires_at is None:
             return False
+        if isinstance(self.expires_at, str):
+            from datetime import datetime
+
+            text = self.expires_at[:-1] + "+00:00" if self.expires_at.endswith("Z") else self.expires_at
+            return datetime.now().astimezone() >= datetime.fromisoformat(text)
         return (now if now is not None else time.monotonic()) >= self.expires_at
 
 
@@ -130,6 +140,10 @@ class InteractionReply:
     run_id: str | None = None
     tool_call_id: str | None = None
     tool_name: str | None = None
+    tool_input: Any = None
+    plan_id: str | None = None
+    plan_digest: str | None = None
+    metadata: Mapping[str, Any] | None = None
 
 
 @runtime_checkable
@@ -163,6 +177,10 @@ class DenyingInteractionPort:
             run_id=request.run_id,
             tool_call_id=request.tool_call_id,
             tool_name=request.tool_name,
+            tool_input=request.tool_input,
+            plan_id=request.plan_id,
+            plan_digest=request.plan_digest,
+            metadata=request.metadata,
         )
 
 
@@ -198,6 +216,10 @@ class RecordingInteractionPort:
                     else reply.tool_call_id
                 ),
                 tool_name=request.tool_name if reply.tool_name is None else reply.tool_name,
+                tool_input=getattr(request, "tool_input", None) if getattr(reply, "tool_input", None) is None else reply.tool_input,
+                plan_id=getattr(request, "plan_id", None) if getattr(reply, "plan_id", None) is None else reply.plan_id,
+                plan_digest=getattr(request, "plan_digest", None) if getattr(reply, "plan_digest", None) is None else reply.plan_digest,
+                metadata=getattr(request, "metadata", None) if getattr(reply, "metadata", None) is None else reply.metadata,
             )
         return InteractionReply(
             request_id=request.request_id,
@@ -208,6 +230,10 @@ class RecordingInteractionPort:
             run_id=request.run_id,
             tool_call_id=request.tool_call_id,
             tool_name=request.tool_name,
+            tool_input=request.tool_input,
+            plan_id=request.plan_id,
+            plan_digest=request.plan_digest,
+            metadata=request.metadata,
         )
 
 
@@ -333,6 +359,10 @@ def _same_reply(first: InteractionReply, second: InteractionReply) -> bool:
         and _optional_same(first.run_id, second.run_id)
         and _optional_same(first.tool_call_id, second.tool_call_id)
         and _optional_same(first.tool_name, second.tool_name)
+        and _optional_same(first.plan_id, second.plan_id)
+        and _optional_same(first.plan_digest, second.plan_digest)
+        and first.tool_input == second.tool_input
+        and getattr(first, "metadata", None) == getattr(second, "metadata", None)
     )
 
 
@@ -352,5 +382,9 @@ def _reply_matches_request(reply: InteractionReply, request: InteractionRequest)
             ("run_id", reply.run_id),
             ("tool_call_id", reply.tool_call_id),
             ("tool_name", reply.tool_name),
+            ("tool_input", reply.tool_input),
+            ("plan_id", reply.plan_id),
+            ("plan_digest", reply.plan_digest),
+            ("metadata", getattr(reply, "metadata", None)),
         )
     )

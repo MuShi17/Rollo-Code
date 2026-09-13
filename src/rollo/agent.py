@@ -7,6 +7,7 @@ Agent 核心循环 — 双后端（Anthropic + OpenAI 兼容）、流式输出�
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import os
@@ -416,6 +417,7 @@ class Agent:
             interaction_port if interaction_port is not None else DenyingInteractionPort()
         )
         self.interaction_registry = InteractionRegistry()
+        self._application_interaction_mode = False
         # 项目上下文：显式优先；缺省按构造点 cwd 一次性解析（D7 保留 CLI 默认语义）。
         self.context = (
             project_context
@@ -1110,6 +1112,37 @@ class Agent:
         """替换交互端口（入口注入终端适配器时使用）。"""
 
         self.interaction_port = port
+
+    def configure_application_interactions(self, enabled: bool = True) -> None:
+        """Enable C03 full-identity interaction envelopes for an Application."""
+
+        self._application_interaction_mode = bool(enabled)
+
+    def configure_runtime_identity(self, *, session_id: str | None = None, run_id: str | None = None) -> None:
+        """Bind a not-yet-started Agent turn to an Application identity."""
+
+        if self.is_processing or (
+            self._runtime_emitter is not None
+            and self._runtime_guard is not None
+            and not self._runtime_guard.is_terminal
+        ):
+            raise AgentClosedError("runtime identity cannot change while an Agent turn is active")
+        if session_id is not None:
+            self.session_id = session_id
+        if run_id is not None:
+            self._runtime_run_id = run_id
+
+    def configure_runtime_store(self, runtime_store: SQLiteRuntimeStore) -> None:
+        """Inject an Application-owned canonical store before the first turn."""
+
+        if self.is_processing or (
+            self._runtime_emitter is not None
+            and self._runtime_guard is not None
+            and not self._runtime_guard.is_terminal
+        ):
+            raise AgentClosedError("runtime store cannot change while an Agent turn is active")
+        self._runtime_store = runtime_store
+        self._runtime_store_owned = False
 
     def set_plan_approval_fn(self, fn: Callable[[str], Awaitable[dict]]) -> None:
         self._plan_approval_fn = fn
@@ -2494,8 +2527,59 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             if self._plan_file_path and Path(self._plan_file_path).exists():
                 plan_content = Path(self._plan_file_path).read_text()
 
+            # Application-owned plan approval uses the same C02 registry/Future
+            # envelope as tool approval.  The terminal adapter may render this
+            # as a simple yes/no decision; the control plane still persists the
+            # plan identity and digest before the decision can affect mode.
+            if self._application_interaction_mode:
+                from .application import params_digest as application_params_digest, plan_digest as application_plan_digest
+
+                plan_id = self._plan_file_path or f"plan:{self.session_id}:{self._runtime_run_id or self.session_id}"
+                digest = application_plan_digest(plan_id, plan_content)
+                request_id = f"plan-approval-{self.session_id}-{uuid.uuid4().hex[:8]}"
+                request = InteractionRequest(
+                    request_id=request_id,
+                    kind=InteractionKind.APPROVAL,
+                    session_id=str(self.session_id),
+                    run_id=str(self._runtime_run_id or self.session_id),
+                    params_digest=application_params_digest(
+                        session_id=str(self.session_id),
+                        run_id=str(self._runtime_run_id or self.session_id),
+                        request_id=request_id,
+                        tool_call_id=None,
+                        tool_name="plan_approval",
+                        tool_input={"plan": plan_content},
+                        plan_id=plan_id,
+                        plan_digest_value=digest,
+                    ),
+                    prompt=plan_content,
+                    tool_call_id=None,
+                    tool_name="plan_approval",
+                    tool_input={"plan": plan_content},
+                    plan_id=plan_id,
+                    plan_digest=digest,
+                    metadata={"plan_approval": True},
+                )
+                self.interaction_registry.open(request)
+                try:
+                    reply = await self.interaction_port.request(request)
+                    resolved = self.interaction_registry.resolve(reply)
+                except asyncio.CancelledError:
+                    with contextlib.suppress(InteractionError):
+                        self.interaction_registry.cancel(request_id)
+                    raise
+                except InteractionError:
+                    return "Plan approval was interrupted or rejected. Continue planning."
+                if not resolved.approved:
+                    return "User rejected the plan and wants to keep planning."
+                choice = (resolved.answer or "execute").strip().lower()
+                if choice not in {"clear-and-execute", "execute", "manual-execute"}:
+                    choice = "execute"
+            else:
+                choice = None
+
             # Interactive approval flow
-            if self._plan_approval_fn:
+            if choice is None and self._plan_approval_fn:
                 result = await self._plan_approval_fn(plan_content)
                 choice = result.get("choice", "manual-execute")
 
@@ -2540,6 +2624,25 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                     f"User approved the plan. Permission mode: {target_mode}\n\n"
                     f"## Approved Plan:\n{plan_content}\n\n"
                     f"Proceed with implementation."
+                )
+
+            if choice is not None:
+                target_mode = "acceptEdits" if choice in {"clear-and-execute", "execute"} else (self._pre_plan_mode or "default")
+                self.permission_mode = target_mode
+                self._pre_plan_mode = None
+                saved_plan_path = self._plan_file_path
+                self._plan_file_path = None
+                self._system_prompt = self._base_system_prompt
+                if self.use_openai and self._openai_messages:
+                    self._openai_messages[0]["content"] = self._system_prompt
+                if choice == "clear-and-execute":
+                    self._clear_history_keep_system()
+                    self._context_cleared = True
+                return (
+                    f"User approved the plan. Permission mode: {target_mode}\n\n"
+                    f"Plan file: {saved_plan_path}\n\n"
+                    f"## Approved Plan:\n{plan_content}\n\n"
+                    "Proceed with implementation."
                 )
 
             # Fallback: no approval function (e.g. sub-agents)
@@ -3550,6 +3653,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 run_id=str(self._runtime_run_id or self.session_id),
                 params_digest=digest_params({"command": command}),
                 prompt=command,
+                tool_input={"command": command},
             )
             self.interaction_registry.open(request)
             self.interaction_registry.resolve(
@@ -3562,13 +3666,29 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             )
             return bool(approved)
 
+        request_id = f"approval-{self.session_id}-{uuid.uuid4().hex[:8]}"
+        application_digest = None
+        if self._application_interaction_mode:
+            from .application import params_digest as application_params_digest
+
+            application_digest = application_params_digest(
+                session_id=str(self.session_id),
+                run_id=str(self._runtime_run_id or self.session_id),
+                request_id=request_id,
+                tool_call_id=None,
+                tool_name=None,
+                tool_input={"command": command},
+                plan_id=None,
+                plan_digest_value=None,
+            )
         request = InteractionRequest(
-            request_id=f"approval-{self.session_id}-{uuid.uuid4().hex[:8]}",
+            request_id=request_id,
             kind=InteractionKind.APPROVAL,
             session_id=str(self.session_id),
             run_id=str(self._runtime_run_id or self.session_id),
-            params_digest=digest_params({"command": command}),
+            params_digest=application_digest or digest_params({"command": command}),
             prompt=command,
+            tool_input={"command": command},
         )
         self.interaction_registry.open(request)
         try:

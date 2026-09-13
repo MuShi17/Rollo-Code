@@ -6,7 +6,7 @@
 
 ### Requirement: Application API 提供统一的运行控制入口
 
-系统 MUST 提供进程内 Application API，至少覆盖 `session.create`、`session.list`、`run.start`、`run.status`、`run.cancel`、`interaction.respond` 与 `shutdown`。调用方 MUST 通过结构化请求和响应使用这些入口，不得依赖 Agent 私有字段、终端输出或 UI 按钮作为控制协议。
+系统 MUST 提供进程内 Application API，至少覆盖 `session.create`、`session.list`、`run.start`、`run.status`、`run.cancel`、`run.resume`、`interaction.respond`、`owner.reconcile` 与 `shutdown`。调用方 MUST 通过结构化请求和响应使用这些入口，不得依赖 Agent 私有字段、终端输出或 UI 按钮作为控制协议。
 
 #### Scenario: 创建并查询会话
 
@@ -58,14 +58,75 @@ Application MUST 为 queued、running、waiting_interaction、cancelling、succe
 
 ### Requirement: 同一 workspace 的 root run 由 Application 统一仲裁
 
-Application MUST 以规范化 workspace 身份约束 active root run；同一 workspace 同时最多一个 active root run，child run MUST 绑定到该 root 的 owner 树。第二个 root 请求 MUST 被明确拒绝或返回已有 owner 信息，不得静默抢占。
+Application MUST 以规范化 `session_id` 约束 active run；同一 session 同时最多一个 active run，child run MUST 绑定到该 session 的 owner 树。同一 workspace 的不同 session MUST 可以各有 active run。第二个针对**同一 session** 的 root 请求 MUST 被明确拒绝（`session_conflict`），不得静默抢占，也不得产生第二次 root dispatch。
 
-#### Scenario: 同 workspace 第二个 root 被拒绝
+#### Scenario: 同一 session 的第二个 root 被拒绝
 
-- **WHEN** 两个受控 Application 调用方同时为同一规范化 workspace 请求 `run.start`
-- **THEN** 只有一个调用方获得 root owner，另一个收到可关联的 owner-conflict 结果，且不会产生第二次 root dispatch
+- **WHEN** 两个受控 Application 调用方同时为同一 session 请求 `run.start`
+- **THEN** 只有第一个获得租约，另一个收到 `session_conflict`，且不会产生第二次 root dispatch
+
+#### Scenario: 同一 workspace 的不同 session 各自运行
+
+- **WHEN** 同一 workspace 的两个 session 分别请求 `run.start`，且第一个仍在运行
+- **THEN** 两个 run 都被接受并各自运行；它们各自的 canonical store、控制记录与终态互不覆盖
 
 #### Scenario: 不同 workspace 可独立运行
 
 - **WHEN** 两个 Application 调用方分别为两个不同规范化 workspace 请求 `run.start`
-- **THEN** 两个 root 可以分别获得 owner，彼此的 session、控制记录和 dispatch 不互相覆盖
+- **THEN** 两个 root 可以分别获得租约，彼此的 session、控制记录和 dispatch 不互相覆盖
+
+### Requirement: interaction.respond 必须绑定实际工具请求
+
+`interaction.respond` MUST 同时校验 `request_id`、`session_id`、`run_id`、`tool_call_id`、`tool_name`、`tool_input`、`plan_id`、`plan_digest` 和 `params_digest`；不适用字段 MUST 显式编码为 null。`plan_digest` MUST be the full SHA-256 of canonical JSON `{plan_id, displayed_plan}`；`params_digest` MUST be the full lowercase SHA-256 of canonical JSON v1/RFC 8785 semantics over `{session_id, run_id, request_id, tool_call_id, tool_name, tool_input, plan_id, plan_digest}`. Application MUST 将回复提交到同一个 pending Future/InteractionRegistry 请求。公共 Application/TUI 路径不得省略这些字段；digest 或身份不匹配时 MUST 拒绝回复且不得调用工具。
+
+#### Scenario: 审批回复绑定真实 tool call
+
+- **WHEN** 调用方回复一个等待中的审批请求并携带与请求记录不同的 tool_call_id 或 params_digest
+- **THEN** 系统返回绑定错误、pending 请求保持未授权，且工具 dispatch 计数为零
+
+#### Scenario: 合法回复唤醒等待方
+
+- **WHEN** 调用方以完全匹配的身份和 digest 回复 pending 请求
+- **THEN** 同一个等待 Future 被完成，等待方只获得一次授权，重复回复只返回首次结果
+
+#### Scenario: interrupted interaction cannot revive an old wait
+
+- **WHEN** a restarted Application receives `interaction.respond` for a request whose old process wait is `interrupted`
+- **THEN** it returns `interaction_interrupted` without dispatch; continuation requires explicit `run.resume` or `owner.reconcile` with a new decision_generation and command/run identity
+
+### Requirement: owner.reconcile and run.resume must be explicit recovery operations
+
+`owner.reconcile` MUST require owner_id, generation and current OS/child evidence, and MUST choose inspect, terminate or release; it MUST NOT silently adopt or replay. `run.resume` MUST create a new command/run identity and MUST reject automatic replay of uncertain tool calls.
+
+#### Scenario: quarantine blocks new root start
+
+- **WHEN** the previous root process crashed and its owner row is `uncertain/held`
+- **THEN** a new `run.start` is rejected until explicit reconcile, and reconcile records its decision and evidence before any release or new run
+
+### Requirement: run.cancel 必须按 run generation 去重
+
+同一 run 的有效取消 MUST 在控制事务中以唯一约束生成唯一 `cancel_generation`；并发插入失败者 MUST 重读已存在 generation。不同 command_id 的后续取消请求 MUST 读取该 generation 的结果，不得再次传播到模型、交互、child 或 shell；cancelling 超时只能重读或显式生成下一次人工恢复操作，不得隐式重复 dispatch。已落定终态 MUST 优先于新的取消请求。
+
+#### Scenario: 不同命令身份的重复取消
+
+- **WHEN** 两个不同 command_id 几乎同时取消同一 run
+- **THEN** 只有一个 cancel generation 和一次 supervisor dispatch，两个响应指向同一取消/终态结果
+
+#### Scenario: 取消并发插入失败后重读
+
+- **WHEN** 两个进程同时为同一 run 插入 cancel generation，其中一个事务先提交
+- **THEN** 失败事务重读已提交 generation 和结果，不产生第二次传播；超时仍保留 cancelling/owner 证据
+
+### Requirement: 跨进程相同命令必须共享唯一结果
+
+同一 workspace 中两个独立 Application 进程同时提交相同 `run.start`、相同摘要或冲突摘要时，控制库 MUST 以持久化唯一约束和 owner 锁仲裁结果。两个进程最终 MUST 读取同一个 command/result 或明确的 digest-conflict；provider/tool dispatch MUST 最多一次，失败进程不得释放另一进程的 owner。
+
+#### Scenario: 两个进程竞争相同 run.start
+
+- **WHEN** 两个独立进程同时提交相同 workspace、session、command_id 和 params_digest 的 `run.start`
+- **THEN** 只有一个 root owner 和一个 run/dispatch 被创建，两个进程重读控制库后得到同一个结果
+
+#### Scenario: 两个进程提交冲突摘要
+
+- **WHEN** 两个独立进程使用同一 command_id 但不同 params_digest 竞争 `run.start`
+- **THEN** 一个请求保留原结果，另一个得到 digest-conflict，重启后仍不存在第二个 run
