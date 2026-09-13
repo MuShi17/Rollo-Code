@@ -1531,9 +1531,17 @@ class Application:
                     result={"side_effect_count": 0},
                 )
         except asyncio.CancelledError:
-            self.control.update_run(run_id, status="cancelled" if run_id in self._cancel_requested else "interrupted", error_code="cancelled" if run_id in self._cancel_requested else "run_interrupted_before_dispatch")
-            if run_id in self._cancel_requested:
-                self.control.update_cancel(run_id, status="cancelled", error_code="cancelled")
+            # Nothing in the runtime cancels a run task: ``run_cancel`` signals
+            # the agent and lets the task finish, and the resulting terminal is
+            # resolved from the ledger above.  This branch therefore only fires
+            # when the surrounding event loop is torn down mid-run, so the task
+            # is interrupted rather than cancelled -- reporting ``cancelled``
+            # here would claim a cancellation that was never requested.
+            self.control.update_run(
+                run_id,
+                status="interrupted",
+                error_code="run_interrupted_before_dispatch",
+            )
             raise
         except Exception as exc:
             self.control.update_run(run_id, status="cancelled" if run_id in self._cancel_requested else "failed", error_code="cancelled" if run_id in self._cancel_requested else "provider_error", result={"error": type(exc).__name__})

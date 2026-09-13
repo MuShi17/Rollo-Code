@@ -75,18 +75,16 @@ def test_control_schema_enforces_run_and_lease_uniqueness(tmp_path: Path):
         }
         assert {"owners", "commands", "tool_operations"}.isdisjoint(tables), tables
 
-        runs_sql = str(
-            store.connection.execute(
-                "SELECT sql FROM sqlite_master WHERE type='table' AND name='runs'"
-            ).fetchone()[0]
-        ).lower().replace(" ", "")
-        assert "unique(session_id,command_id)" in runs_sql, runs_sql
-
         lease_rows = list(store.connection.execute("PRAGMA table_info(session_leases)"))
         lease_columns = {str(row["name"]) for row in lease_rows}
         assert "pid" in lease_columns, lease_columns
         assert "process_id" not in lease_columns, lease_columns
         assert [str(row["name"]) for row in lease_rows if int(row["pk"]) == 1] == ["session_id"]
+
+        # The columns below are asserted by behaviour rather than by matching the
+        # DDL text: a semantic-preserving rewrite of the constraint (for example
+        # swapping the column order, which uniqueness does not care about) must
+        # not be reported as a regression.
 
         # And the constraints must actually bite: a second run row for the same
         # (session_id, command_id) can never be stored.
@@ -99,6 +97,12 @@ def test_control_schema_enforces_run_and_lease_uniqueness(tmp_path: Path):
                 "INSERT INTO runs(run_id,session_id,workspace_id,command_id,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
                 ("run-2", "s", "w", "c", "queued", now, now),
             )
+        # ... while a different command id in the same session is still allowed,
+        # so the constraint is on the pair and not on either column alone.
+        store.connection.execute(
+            "INSERT INTO runs(run_id,session_id,workspace_id,command_id,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+            ("run-3", "s", "w", "c-other", "queued", now, now),
+        )
 
         store.connection.execute(
             "INSERT INTO session_leases(session_id,workspace_id,owner_id,pid,acquired_at,updated_at) VALUES(?,?,?,?,?,?)",
