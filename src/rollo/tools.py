@@ -12,11 +12,13 @@ grep_search, run_shell, skill, enter/exit_plan_mode, agent, tool_search, web_fet
 from __future__ import annotations
 
 import fnmatch
+import asyncio
 import json
 import os
 import re
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +26,7 @@ from .memory import get_memory_dir
 from .frontmatter import parse_frontmatter
 from .project_context import ProjectContext
 from .tool_result import MAX_TOOL_RESULT_BYTES, is_tool_result_error, public_tool_result
+from .execution import ManagedExecutionHandle, ManagedExecutionSnapshot, StreamCapture
 
 # ─── 权限模式 ──────────────────────────────────────────────
 # 5种模式控制工具执行的安全级别，从完全开放到只读计划模式
@@ -43,6 +46,69 @@ IS_WIN = sys.platform == "win32"
 # ─── 类型别名 ──────────────────────────────────────────────
 
 ToolDef = dict  # Anthropic 兼容的 tool schema 字典
+
+
+async def execute_managed_shell(
+    command: str | list[str],
+    *,
+    context: "ProjectContext",
+    owner_id: str,
+    execution_id: str,
+    timeout: float | None = None,
+    spill_dir: str | Path | None = None,
+) -> tuple["ManagedExecutionSnapshot", str]:
+    """Run a shell command through the C03 managed stdout/stderr supervisor."""
+
+    handle = ManagedExecutionHandle(
+        owner_id=owner_id,
+        execution_id=execution_id,
+        spill_dir=spill_dir or (context.runtime_data_dir / "execution-spill"),
+    )
+    await handle.start(command, cwd=context.tool_cwd, shell=isinstance(command, str))
+    snapshot = await handle.wait(timeout=timeout)
+    stdout = snapshot.stdout.data.decode("utf-8", errors="replace") if snapshot.stdout else ""
+    stderr = snapshot.stderr.data.decode("utf-8", errors="replace") if snapshot.stderr else ""
+    output = stdout
+    if stderr:
+        output += ("\n" if output else "") + stderr
+    return snapshot, output
+
+
+async def _run_shell_managed(inp: dict, *, context: "ProjectContext | None") -> str:
+    """Async Agent path for run_shell; keeps both pipes drained until exit."""
+
+    if context is None:
+        context = ProjectContext.from_root(Path.cwd())
+    timeout_ms = inp.get("timeout", 30000)
+    timeout_s = timeout_ms / 1000 if timeout_ms is not None else None
+    handle = ManagedExecutionHandle(
+        owner_id=str(getattr(context, "workspace_id", "application")),
+        execution_id=f"shell-{uuid.uuid4().hex}",
+        spill_dir=context.runtime_data_dir / "execution-spill",
+    )
+    await handle.start(inp["command"], cwd=context.tool_cwd, shell=isinstance(inp["command"], str))
+    try:
+        snapshot = await handle.wait(timeout=timeout_s)
+    except asyncio.CancelledError:
+        await handle.cancel()
+        raise
+    output = ""
+    if snapshot.stdout:
+        output += snapshot.stdout.data.decode("utf-8", errors="replace")
+    if snapshot.stderr:
+        output += ("\n" if output else "") + snapshot.stderr.data.decode("utf-8", errors="replace")
+    if snapshot.requested_cancel and timeout_s is not None:
+        return f"Command timed out after {timeout_ms}ms"
+    if snapshot.returncode not in (0, None):
+        stderr = snapshot.stderr.data.decode("utf-8", errors="replace") if snapshot.stderr else ""
+        stdout = snapshot.stdout.data.decode("utf-8", errors="replace") if snapshot.stdout else ""
+        details = ""
+        if stdout:
+            details += f"\nStdout: {stdout}"
+        if stderr:
+            details += f"\nStderr: {stderr}"
+        return f"Command failed (exit code {snapshot.returncode}){details}"
+    return output or "(no output)"
 
 # ─── 工具定义 ───────────────────────────────────────────────
 # 每个工具遵循 Anthropic tool use 格式：name、description、input_schema
@@ -920,6 +986,9 @@ async def execute_tool_value(
     # 防止模型在未读取文件内容的情况下盲目编辑，以及外部并发修改导致的冲突
     if name == "read_file":
         return _read_file(inp, context=context)
+
+    if name == "run_shell":
+        return await _run_shell_managed(inp, context=context)
 
     if name in ("write_file", "edit_file") and read_file_state is not None:
         abs_path = _resolve_tool_path(inp["file_path"], context)

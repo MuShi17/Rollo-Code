@@ -34,12 +34,17 @@ C03 接入 MUST 保持已有 flags、权限模式、退出码、REPL 命令、�
 
 ### Requirement: TUI 的 owner、取消和恢复必须可验证
 
-TUI MUST 使用 C03 的共同 owner 锁、命令身份和公开 cancel/status 接口；同 workspace 的第二个入口必须得到明确冲突结果，取消必须传播到模型、交互、shell 和 child，resume 必须读取持久化状态而非自动重放不确定工具。
+TUI MUST 使用 C03 的共同 session 租约、命令身份和公开 cancel/status 接口；同一 session 的第二个入口必须得到明确的 `session_conflict`，而同一 workspace 的不同 session MUST 可以并行，取消必须传播到模型、交互、shell 和 child，resume 必须读取持久化状态而非自动重放不确定工具。
 
-#### Scenario: 第二个 TUI 入口不能重复 dispatch
+#### Scenario: 第二个入口不能重复 dispatch 同一 session
 
-- **WHEN** 一个 TUI 已占用 workspace owner，第二个受控 TUI/Application 入口提交相同 workspace 的运行
-- **THEN** 第二个入口得到 owner-conflict 或已有运行结果，不产生第二个 root dispatch
+- **WHEN** 一个 TUI 已持有某 session，第二个受控 TUI/Application 入口提交**同一 session** 的运行
+- **THEN** 第二个入口得到 `session_conflict`，不产生第二个 root dispatch
+
+#### Scenario: 同一 workspace 的不同 session 并行（TUI 与 GUI）
+
+- **WHEN** TUI 持有 session A 正在运行，受控 Application 在同一 workspace 提交 session B 的运行
+- **THEN** session B 被接受；两个会话各自的 canonical store 与控制记录互不覆盖
 
 #### Scenario: TUI 完成会话到恢复闭环
 
@@ -59,3 +64,40 @@ C03 的 TUI/Application 集成 MUST 在进程内、离线、临时 workspace/run
 
 - **WHEN** 验证需要 stdio wire、Electron 窗口、Windows 安装包或真实付费 Harbor 任务
 - **THEN** 该验证被记录为 C05/C06/C07 或独立环境 Gate 的前置，不修改 C03 代码或把缺失证据宣称为 C03 通过
+
+### Requirement: plan approval 与 REPL 必须使用同一 Application contract
+
+plan approval MUST reuse C02 `InteractionKind.APPROVAL` with restricted `plan_approval` metadata, stable request/tool identity and the same pending Future used by other interactions. REPL MUST reuse one session while creating a distinct run per prompt; neither path MAY read Agent private state or create a second control state machine. After restart, the old Future MUST be recorded as interrupted; a new Application MUST reject the old response and require explicit `run.resume`/`owner.reconcile` with a new decision generation.
+
+#### Scenario: plan approval through public interaction
+
+- **WHEN** plan mode waits for approval and the caller submits `interaction.respond`
+- **THEN** the approval is persisted with its digest, the pending wait is released once, and the run continues or is denied through the normal lifecycle guard; after restart the old wait is interrupted and a late response is rejected without dispatch
+
+#### Scenario: REPL multi-turn session
+
+- **WHEN** a user submits two prompts in one REPL session and resumes the session later
+- **THEN** both runs share the same session/workspace binding, each has its own command/run identity, and resume observes persisted state without replaying uncertain tools
+
+### Requirement: plan approval payload MUST be bound to plan identity
+
+Plan approval MUST use C02 `InteractionKind.APPROVAL` plus restricted metadata containing `plan_id` and `plan_digest`; `plan_digest` MUST be the full SHA-256 of canonical JSON `{plan_id, displayed_plan}`, and the interaction digest MUST include that value plus the nullable tool-call fields under the same canonical JSON v1 rules. REPL commands such as `/clear`, `/plan` and `/compact` MUST be represented as explicit Application operations or read-only controls with stable session/run scope, not direct Agent private-state mutation.
+
+#### Scenario: modified plan is rejected
+
+- **WHEN** a caller responds with a digest for a plan different from the pending plan_id/plan_digest
+- **THEN** the response is rejected before dispatch and the pending approval remains unresolved
+
+#### Scenario: REPL control command scope
+
+- **WHEN** a user invokes `/clear`, `/plan` or `/compact` during a session
+- **THEN** the Application receives a typed operation with the same ProjectContext/session binding, and no direct private Agent lifecycle field is changed by the TUI
+
+### Requirement: C03 consumer evidence must be real and reproducible
+
+The C03 acceptance evidence MUST include a real local CLI/TUI consumer and a real local Python subprocess for ownership/cancellation cases, while provider responses MAY use an offline deterministic fixture. The evidence MUST record interpreter version, workspace/runtime paths, commands, exit codes, and whether each actor is mock, fixture, or OS process.
+
+#### Scenario: offline CLI consumer evidence
+
+- **WHEN** the focused C03 consumer command runs with a temporary workspace and deterministic offline provider
+- **THEN** the recorded output demonstrates session/run/interaction/cancel/resume behavior without relying on private Agent fields or remote provider access, and records the exact command, exit code, interpreter version, repeat count and golden output/exit-code baseline

@@ -168,10 +168,8 @@ class ProjectContext:
         data_dir = (
             Path(runtime_data_dir).expanduser()
             if runtime_data_dir is not None
-            else Path(
-                os.environ.get("ROLLO_RUNTIME_DIR") or (Path.home() / ".rollo")
-            )
-        )
+            else Path(os.environ.get("ROLLO_RUNTIME_DIR") or (Path.home() / ".rollo"))
+        ).resolve()
         config_root = resolved / ".rollo"
         identity = workspace_id_for(resolved)
         return cls(

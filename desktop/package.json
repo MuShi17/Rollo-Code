@@ -1,0 +1,30 @@
+{
+  "name": "rollo-desktop",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Rollo Code desktop shell: Electron main process, preload bridge and workspace worker registry.",
+  "main": "dist/main/index.js",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "node scripts/build-electron.mjs && vite build",
+    "test": "vitest run",
+    "test:e2e": "npm run build && playwright test",
+    "dev": "npm run build && electron ."
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.49.0",
+    "@types/node": "^22.10.0",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "electron": "^33.2.0",
+    "esbuild": "^0.28.2",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.3",
+    "vitest": "^2.1.8"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  }
+}

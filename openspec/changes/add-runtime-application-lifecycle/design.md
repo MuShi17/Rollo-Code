@@ -34,9 +34,33 @@ C02 已把 runtime 产生的输出和人工交互抽象为 `OutputPort`、`Inter
 
 ## Decisions
 
+> ### 决策有效性（v3，2026-09-13）
+>
+> 本文件的多条决策在 **方案 v3**（任务卡 §10、批次总览 §14）中被修订或作废。下表是唯一有效性判据——不要依据决策章节的原有措辞判断其是否仍然生效。
+>
+> | 决策 | v3 状态 | 变化 |
+> | --- | --- | --- |
+> | D1 Application 作为进程内控制面 | **有效** | 不变 |
+> | D2 命令 envelope + 单状态串行器 | **修订** | envelope 与 `params_digest` 命令载体取消；幂等改由 `runs(session_id, command_id)` 等持久唯一约束承担 |
+> | D3 控制库承载控制状态、canonical 保持事实边界 | **有效** | 不变 |
+> | D4 workspace 锁使用 OS 持有句柄 | **作废** | 互斥单位改为 session（`session_leases`）；`workspace_lock.py` 已删除 |
+> | D5 ManagedExecutionHandle 统一取消与 OS 退出观察 | **有效** | 不变 |
+> | D6 TUI 是 Application 的消费者 | **有效** | 不变 |
+> | D7 恢复按证据分类、默认 fail closed | **有效** | 收窄为 **run 级**：分类不再升级为 workspace 级隔离 |
+> | D8 冻结 control/canonical 双库边界与崩溃协议 | **修订** | 跨库一致性机制取消（控制库不再重复记录 canonical 已有事实）；崩溃恢复只分类、不阻塞 |
+> | D9 冻结锁命名空间与 owner capability | **作废** | 见 D4；owner capability / generation / quarantine / `owner.reconcile` 全部取消 |
+> | D10 冻结 interaction Future、tool-call 绑定 | **有效** | 绑定校验保留（`_reply_matches_row` 是防省略身份伪造的唯一防线） |
+> | D11 冻结 run-level cancel 去重 | **有效** | 不变 |
+> | D12 冻结旧 session 归属与 inspect-only | **有效** | 不变 |
+> | D13 冻结审查证据与实现入口 | **有效** | 不变 |
+> | D14 冻结 control/canonical 状态映射矩阵 | **修订** | 映射表本身保留且是恢复权威；其中 owner/quarantine 行、以及「须显式 reconcile 才可再运行」作废 |
+> | D15 冻结 interaction adapter 与重启协议 | **有效** | 不变 |
+> | D16 冻结 tool-call digest 与受管执行模型 | **修订** | digest 由 RFC 8785/JCS 改为普通 canonical JSON（比较始终在同一持有者进程内） |
+
 ### D1：以 Application 作为唯一进程内控制面，Agent 作为受管理执行器
 
-新增 `application.py`，对外提供结构化 command/result 类型和异步控制方法；外部调用方只提交操作名、稳定身份、`ProjectContext`、受限参数及超时，返回 session/run/interaction/owner 状态。Application 内部负责命令校验、幂等查询、拥有权仲裁、状态持久化和执行监督，再把实际模型调用委托给已有 `Agent`。
+新增 `application.py`，对外提供结构化 command/result 类型和异步控制方法；外部调用方只提交操作名、稳定身份、`ProjectContext`、受限参数及超时，返回 session/run/interaction 状态。Application 内部负责命令校验、幂等查询、session 租约仲裁、状态持久化和执行监督，再把实际模型调用委托给已有 `Agent`。
+
 
 `Agent` 继续负责 provider loop、工具选择和 C02 事件发布，但不再成为 TUI 的生命周期协议。Application 创建 Agent 时显式注入 `ProjectContext`、`OutputPort`、`InteractionPort`、runtime store 和 owner context；取消通过 Application 的 supervisor 调用公开的 Agent/port 取消能力，并将结果写回控制面。入口不得读取或修改 `_aborted`、`_output_buffer`。
 
@@ -50,9 +74,13 @@ C02 已把 runtime 产生的输出和人工交互抽象为 `OutputPort`、`Inter
 
 ### D2：用命令 envelope 和单一状态串行器实现幂等与终态唯一
 
+> **v3 修订**：command envelope 与 `params_digest` 命令载体已取消。幂等由持久唯一约束承担（`runs(session_id, command_id)`、`sessions.create_command_id`、`pending_interactions.command_id`、`cancel_generations`），不再有独立的命令状态机。本节其余关于「终态唯一」与「先提交再 dispatch」的论述仍然有效。
+
 所有 `run.start`、`run.cancel`、`interaction.respond` 等有副作用操作使用统一 envelope，至少包含 `command_id`、`scope_type`、`scope_id`、`operation`、`params_digest`、`session_id`、可选 `run_id/request_id`、提交时间和 schema 版本。参数摘要只覆盖允许持久化的规范化参数，不保存 API key、完整 provider 配置或原始敏感载荷。
 
-Application 先在同一个控制边界内按 `(scope_type, scope_id, command_id)` 查询：相同摘要返回第一次的响应/目标身份；摘要不同返回冲突；未知命令再进入状态转移。进程内用一个按 workspace 的异步串行器避免竞态，跨进程依靠 SQLite 受保护事务和 workspace owner 锁共同约束。终态转移使用集中 guard，成功、失败、取消、interrupted、uncertain 只能单向提交一次；取消与终态竞争时，谁先在控制事务中成功落定谁拥有终态，另一方只能读取已落定结果。
+Application 先在同一个控制边界内按 `(scope_type, scope_id, command_id)` 查询：相同摘要返回第一次的响应/目标身份；摘要不同返回冲突；未知命令再进入状态转移。进程内用一个按 session 的异步串行器避免竞态，跨进程依靠 SQLite 受保护事务和 session 租约共同约束。终态转移使用集中 guard，成功、失败、取消、interrupted、uncertain 只能单向提交一次；取消与终态竞争时，谁先在控制事务中成功落定谁拥有终态，另一方只能读取已落定结果。
+
+互斥的单位是 **session** 而非 workspace：每个 session 拥有自己的 canonical store，因此同一 workspace 的不同 session 可以被不同客户端（例如 TUI 与 GUI）同时持有并各自运行；只有同一 session 不能被两个存活进程同时持有。workspace 级 `owner` 记录保留为诊断与恢复归属信息（把孤儿 run 归因到某个进程并按 D14 分类），不作为拒绝新工作的闸门。
 
 **考虑过的替代方案：**
 
@@ -80,6 +108,8 @@ Application 先在同一个控制边界内按 `(scope_type, scope_id, command_id
 - 通过重建/删除旧库完成迁移：会破坏历史事实且无法恢复未知结果，因此不采用。
 
 ### D4：workspace 锁使用 OS 持有句柄，owner 元数据只做诊断
+
+> **v3 作废**：互斥单位改为 **session**（`session_leases`，持有进程消失自动接管）。`workspace_lock.py` 已删除；`owner` 行、`generation`、`quarantine`、`owner.reconcile` 全部取消，只保留 `runs.owner_pid` 供崩溃恢复归属。保留本节仅作历史记录。
 
 实现 `workspace_lock.py` 的后端接口，以规范化 `workspace_id` 计算锁键，并使用标准库实现的 OS 级独占句柄/咨询锁。锁的“是否持有”由活跃句柄决定，而不是 lock 文件是否存在或其中记录的 PID；锁记录中的 `owner_id`、root/run/session、创建时间和版本仅用于冲突诊断。TUI 和 Application 都从同一个工厂取得同一个锁键。
 
@@ -124,6 +154,103 @@ TerminalOutputPort 继续复用 `ui.py`，不解析控制台文本来获得状�
 
 恢复只提供状态查询、显式 resume/人工决策和安全的只读 projection；禁止自动重放可能有副作用的工具。旧 session 先以只读形式解析，迁移写入新版本前保留原记录和未知字段；迁移失败只返回诊断，不删除、覆盖或静默绑定到当前 workspace。没有可证明 workspace 归属的旧记录不得被当前 `ProjectContext` 自动认领。
 
+### D8：冻结 control/canonical 双库边界与崩溃协议
+
+> **v3 修订**：跨库一致性机制取消——不一致问题源于控制库重复记录 canonical 已有的事实，不重复即无此问题（`tool_operations` 控制侧副本一并删除）。崩溃恢复只分类、不阻塞 workspace。
+
+控制记录使用独立的 workspace 控制库：`ProjectContext.runtime_data_dir / "application" / workspace_id / "control.sqlite"`；canonical store 的唯一映射为 `ProjectContext.runtime_data_dir / "sessions" / session_id / "runtime.sqlite"`，由显式 context/session 解析并校验 workspace_id，Application 必须把该路径注入 Agent 和 store，禁止回退到全局 cwd/导入期常量。两者不共享事务，也不把控制记录写入 canonical event payload。跨库一致性由 `dispatch_intent`、`canonical_correlation_id` 和恢复分类协议表达：
+
+1. control commit 前禁止 provider、tool、shell 或 interaction dispatch；
+2. control commit 后才允许 dispatch，并把观察到的 canonical event / execution handle 关联回控制记录；
+3. 任一跨库窗口崩溃均落为 `interrupted` 或 `uncertain`，恢复只读并禁止自动重放；
+4. 测试必须由独立 worker 进程在 control commit 前、control commit 后/canonical append 前、canonical append 后/result 记录前和 response 丢失四个精确屏障调用 `os._exit`（Windows 等价为 `TerminateProcess`），再启动新的 Application 进程；每个阶段都要联合检查 control.sqlite、canonical SQLite、恢复状态和 provider/tool/shell side-effect marker/count。
+
+控制库使用 schema version、workspace_id、command_id 唯一键和事务内状态 guard；canonical store 的 append/close 仍由 C02 原有接口负责。这样明确承认跨库不存在 exactly-once，同时保证“可追踪、不可静默重放”。
+
+控制记录中的 `canonical_correlation_id` 是版本化的结构化关联对象，不是 C02 `operation_id` 的别名：它至少包含 `workspace_id/session_id/run_id`，以及截至当前观察到的 `invocation_ids[]/turn_ids[]` 集合和逐工具对象 `tool_operations[]`（每项为 `operation_id/provider_tool_call_id/tool_name/canonical_args_hash`）。`command_id` 只属于 control 命令幂等域；每个 C02 tool dispatch 以自身 `operation_id` 单独加入集合，因此一个 run 可以关联零个、一个或多个 tool operation，provider-only terminal 的 `tool_operations[]` 明确为空。集合按规范化排序保存，缺失或矛盾的关联不猜测、不自动合并。
+
+### D9：冻结锁命名空间与 owner capability
+
+> **v3 作废**：见 D4。锁命名空间、owner capability、generation 校验与 `owner.reconcile` 的三路分派均已取消。
+
+锁命名空间为 `sha256("rollo-workspace-lock-v1:" + workspace_id)[:32]`，锁句柄位于控制目录下；锁键、控制库路径和诊断中的 workspace_id 必须由同一个规范化 `ProjectContext` 生成。owner token 使用不可猜测的随机 capability，记录 `owner_id/root_owner_id/parent_owner_id` 和 generation；PID、文件存在性和 UI 状态只允许用于诊断。
+
+root owner 取得锁后才能接受 root `run.start`；child 只接受同一 root capability 派生的 capability。foreign release/cancel、旧 generation、不同 workspace 和已关闭 owner 均返回明确错误且不修改执行树。物理 OS handle 由 root Application 持有，root 崩溃后 OS 会释放 handle；控制库把 owner row 标记为 `uncertain/held` quarantine，新 Application 在显式 `owner.reconcile` 前拒绝新的 root start。`owner.reconcile` 必须携带 owner_id、generation 和 OS/child evidence，可选择 inspect、terminate 或 release；不得 silent adopt、silent release 或 replay。真实多进程测试必须验证“root 崩溃后第二入口被逻辑 quarantine 拒绝；reconcile 前后 child、lock 和 control row 的精确状态”。
+
+### D10：冻结 interaction Future、tool-call 绑定和 plan/REPL contract
+
+每个 pending interaction 同时登记 `request_id/session_id/run_id/tool_call_id/tool_name/tool_input/plan_id/plan_digest/params_digest`（不适用值显式为 null），ApplicationInteractionPort 为其创建唯一 awaitable Future。`interaction.respond` 必须校验全部身份和 digest，在控制事务中落盘、由适配器调用一次 registry.resolve 后完成同一个 Future；Agent 在此路径不得再次 resolve。重复回复返回原结果，cancel/shutdown/timeout 以固定 reason 的非批准 `InteractionReply` 完成 Future，迟到回复不能触发工具。Future 完成是等待方解除的唯一控制信号，不允许 TUI 直接调用 registry 私有状态。
+
+plan approval 使用同一 `interaction.respond` envelope，沿用 C02 已存在的 `InteractionKind.APPROVAL`，并在受限 metadata 中标记 `plan_approval=true`，不扩展第二种 kind；REPL 每条 prompt 复用同一 session、创建新 run，并通过 `run.status` 观察终态。one-shot、REPL、resume 的 flags、EOF、退出码和权限模式由同一 Application contract 适配，不为 plan 或 REPL 增加第二套状态机。重启后旧 Future 必须固定为 `interrupted`；新进程不得唤醒旧 Future，旧 request 的 `interaction.respond` 必须拒绝，继续只能由显式 `run.resume`/`owner.reconcile` 创建新的 decision generation。
+
+### D11：冻结 run-level cancel 去重
+
+`run.cancel` 的幂等键除 command identity 外还包括 `(workspace_id, run_id, cancel_generation)`。同一 run 的第一个有效 cancel 生成唯一 `cancel_generation`、进入 `cancelling` 并向 supervisor 发出一次传播；不同 `command_id` 的后续 cancel 只读取该 generation 的结果，不再次 dispatch。若 run 已有成功/失败/取消/中断/不确定终态，cancel 只能返回已落定结果，不覆盖终态。超时后的继续动作只能是显式 `owner.reconcile`/`run.resume` 新命令，不能隐式重复 cancel dispatch。
+
+### D12：冻结旧 session 归属与 inspect-only
+
+控制记录或 session 缺少可验证 workspace_id 时，`session.list` 只能返回 `inspect_only` 条目；resume/run/interaction/cancel/shutdown 对该条目一律拒绝，除非调用方显式提供一次性迁移映射并通过 schema 校验。映射失败保留原文件和未知字段，不按当前 cwd、session 名称或 PID 自动认领。
+
+### D13：冻结审查证据与实现入口
+
+设计审查必须逐条检查 D8-D12 及 proposal 的 Gate closure contract；测试策略必须提供真实本地 Python 子进程、多进程 owner、两个独立 Application 进程的 command-idempotency 竞争、双 stdout/stderr drain、crash/restart fault injection、CLI/TUI consumer 和 C02 regression 的可复现命令。只有两类独立审查均 sufficient、`openspec validate --strict` 通过、主 Agent 完成差异/授权核验后，才允许进入 C03 implementation；独立审查意见不自动等于接受。
+
+### D14：冻结按 operation 的 control/canonical 状态映射矩阵
+
+> **v3 修订（重要）**：**映射矩阵本身仍然有效，且是恢复分类的权威**（`interrupted`/`uncertain`/`run_dispatch_not_observed`/`tool_outcome_uncertain` 等取值不变）。作废的只有其中与 owner/quarantine 相关的行，以及「新入口必须先执行 owner.reconcile 才能再运行」这一要求——崩溃不再阻塞 workspace，也不存在需要人工清除的隔离状态。另：活路径的空账本分支曾与 B2 行冲突（把无证据的 run 报成 `succeeded`），已修复为按本矩阵返回 `interrupted`/`run_dispatch_not_observed`。
+
+Application control 状态不替换 C02 canonical 状态；恢复通过下表把证据投影为唯一可观察的 C03 状态：
+
+| operation | control evidence | canonical evidence | C03 result | error_code | side effect rule |
+| --- | --- | --- | --- | --- | --- |
+| `run.start` | no accepted row / commit failed | no dispatch | `not_accepted` | `command_not_accepted` | no side effect; retry is safe only because no accepted evidence exists |
+| `run.start` | accepted, no dispatch_intent | no model/tool dispatch | `interrupted` | `run_interrupted_before_dispatch` | never auto-dispatch |
+| `run.start` | dispatch_intent committed | no canonical model/tool dispatch | `interrupted` | `run_dispatch_not_observed` | manual inspection; no auto-replay |
+| `run.start` | dispatch_intent committed | canonical tool_dispatch without matching outcome | `uncertain` | `tool_outcome_uncertain` | side-effect count must not increase on recovery |
+| `run.start` | accepted and terminal evidence | canonical `completed` | `succeeded` | `null` | terminal is read-only |
+| `run.start` | accepted and terminal evidence | canonical `failed` | `failed` | `provider_error` | terminal is read-only |
+| `run.start` | accepted and terminal evidence | canonical `cancelled` | `cancelled` | `cancelled` | terminal is read-only |
+| `run.start` | accepted and terminal evidence | canonical `budget_exceeded` | `failed` | `budget_exceeded` | terminal is read-only; preserve budget error details |
+| `run.start` | accepted and no tool call | provider/model terminal success with matching correlation | `succeeded` | `null` | provider-only evidence is matched by correlation |
+| `run.start` | accepted and no tool call | provider/model terminal error with matching correlation | `failed` | `provider_error` | provider-only evidence is matched by correlation |
+| `run.cancel` | cancel accepted, propagation unconfirmed | no terminal evidence | `cancelling` | `cancel_propagation_unconfirmed` | one cancel generation; owner retained |
+| `run.cancel` | cancel propagation confirmed | canonical `cancelled` | `cancelled` | `cancelled` | no second propagation |
+| `run.cancel` | recovery reports abort without canonical terminal | recovery `aborted` | `interrupted` | `recovery_aborted` | no second propagation; explicit resume/reconcile only |
+| `interaction.respond` | reply and Future commit complete | no subsequent dispatch yet | `resolved` decision; run remains waiting/running | `null` | response is not a run terminal |
+| `interaction.respond` | command accepted but reply or Future commit incomplete before crash | no completed reply evidence | `interrupted` | `interaction_interrupted` | old request/Future is never revived; old response is rejected |
+| `interaction.respond` | reply and Future commit complete; dispatch phase not yet started | no subsequent dispatch yet | `resolved` decision; run remains waiting/running | `null` | later dispatch is classified by the `run.start` rows |
+| `interaction.respond` | reply and Future commit complete | canonical tool_dispatch/outcome matched | interaction remains `resolved`; run projection follows `run.start` rows | `null` | digest mismatch never dispatches |
+| `shutdown` | phase accepted but incomplete | live child/store/MCP evidence | `shutdown_incomplete` | `shutdown_incomplete` | second entry rejected; quarantine retained |
+| `shutdown` | all phases confirmed | matching terminal/closed evidence | `shutdown_complete` | `null` | owner released last |
+| any | control/canonical terminal conflict | contradictory evidence | `uncertain` | `control_canonical_conflict` | preserve both records, no overwrite |
+
+The control command identity remains `(workspace_id, session_id, run_id, command_id, request_id?, tool_call_id?, tool_name?, params_digest?)`; nullable fields are encoded as explicit nulls. `command_id` MUST NOT be mapped to or stored as a C02 `operation_id`. Canonical matching is frozen as follows: `session_id` and `run_id` must match exactly; observed C02 `invocation_id` and `turn_id` are retained as sets (they are not one-to-one replacements for `run_id` or `request_id`); a `request_id` may be related to a `turn_id` only when the same interaction turn is explicitly recorded; each tool dispatch/outcome is joined by its own `operation_id` plus `provider_tool_call_id/tool_name/canonical_args_hash`, and the complete paired object is retained in `canonical_correlation_id.tool_operations[]`. Provider-only terminal evidence is joined by exact `(session_id, run_id)` plus any recorded invocation/turn constraints and has an empty tool-operation set. `error_code` is a stable lowercase string or JSON `null`; `null` is reserved for confirmed success/resolved/shutdown-complete projections, while cancellation is a terminal-with-reason and therefore uses `cancelled`. The precedence is: durable tool dispatch without outcome forces `uncertain`; a terminal control row cannot override contradictory canonical evidence; canonical evidence cannot create a control terminal without a matching command/run identity. The following four hard-crash barrier oracle is normative and MUST assert every column, including exact `error_code` and side-effect count:
+
+| barrier | operation | control evidence | canonical evidence | result | error_code | side-effect count after recovery |
+| --- | --- | --- | --- | --- | --- | --- |
+| B1 control commit before dispatch | `run.start` | no accepted row | no dispatch | `not_accepted` | `command_not_accepted` | `0` |
+| B2 accepted before canonical dispatch | `run.start` | accepted + dispatch_intent | no canonical dispatch | `interrupted` | `run_dispatch_not_observed` | `0` |
+| B3 canonical dispatch before outcome | `run.start` | accepted + dispatch_intent | tool_dispatch without outcome | `uncertain` | `tool_outcome_uncertain` | unchanged from pre-crash marker; no recovery increment |
+| B4 interaction response lost | `interaction.respond` | command accepted, reply/Future incomplete | no completed reply or tool dispatch | `interrupted` | `interaction_interrupted` | `0` |
+
+Unknown tool lookup MUST return `unknown_tool`; an unknown/uncertain post-dispatch result MUST return `unknown_tool_result` and preserve `uncertain`. Migration failure MUST return `migration_error`, and an inspect-only record MUST return `inspect_only`; these codes are distinct from the D14 crash barriers.
+
+Canonical identity edge cases are deterministic: a tool dispatch with no `operation_id` in its action/refs returns `result=uncertain`, `error_code=canonical_identity_missing`, is quarantined without execution, and asserts side-effect count `0`; contradictory `session_id/run_id/invocation_id/turn_id/operation_id/provider_tool_call_id/tool_name/canonical_args_hash` returns `result=uncertain`, `error_code=canonical_identity_conflict`, preserves both records, and recovery adds no side effect; multiple same-run tool operations are tracked independently and a missing outcome makes only the corresponding operation uncertain while the run projection remains `uncertain` until its operation set is resolved. A provider-only terminal with more than one candidate invocation/turn and no explicit match returns `result=uncertain`, `error_code=canonical_identity_ambiguous`, preserves all candidates, and recovery adds no side effect; none of these three errors projects a success/failed/cancelled terminal or triggers automatic replay.
+
+### D15：冻结 Application interaction adapter and restart protocol
+
+The C03 Application supplies an `ApplicationInteractionPort` implementing the existing C02 `InteractionPort.request(request) -> InteractionReply` contract. On request, the adapter first persists the pending identity and creates one Future keyed by `request_id`; it then delegates display/observation to the injected port. `Application.interaction_respond` validates identity/digest, persists the reply, resolves the C02 registry exactly once, and completes that Future. Agent code never resolves the registry a second time on this adapter path.
+
+Cancel, shutdown and timeout each complete the same Future with a non-approved `InteractionReply` carrying a stable reason (`cancelled`, `shutdown_timeout` or `expired`); a late reply is rejected and cannot dispatch a tool. On restart, a new Application reconstructs the pending row but MUST mark the old process wait as `interrupted`; an `interaction.respond` for that interrupted request is rejected with `interaction_interrupted`. Continuing requires explicit `run.resume` or `owner.reconcile`, which creates a new `decision_generation` and command/run identity; it may not replay an uncertain tool. This is the sole restart behavior.
+
+### D16：冻结 tool-call digest and managed execution model
+
+> **v3 修订**：digest 由 RFC 8785/JCS 改为普通 canonical JSON（`sort_keys` + 紧凑分隔符 + `ensure_ascii=False`，并保持拒绝非有限数）。理由：该比较始终发生在同一持有者进程内（由 session 租约保证），不需要跨语言一致。受管执行模型本身不变。
+
+The approval digest input is canonical JSON v1 (RFC 8785/JCS semantics: UTF-8, sorted object keys, preserved array order, no insignificant whitespace, explicit nulls, rejected NaN/Infinity) of `{session_id, run_id, request_id, tool_call_id, tool_name, tool_input, plan_id, plan_digest}`. `tool_input` and non-applicable plan fields are explicit nulls. The digest is the full lowercase SHA-256 hex string, never an implicit truncation. A plan digest is separately the SHA-256 of canonical `{plan_id, displayed_plan}`; the interaction digest includes that plan_digest. Public Application replies MUST include all identity fields and this digest; only an internal C02 migration adapter may fill omitted legacy fields, and that adapter cannot be used by C03 Application/TUI paths. A changed tool input, displayed plan, reused provider tool-call id or mismatched request identity returns `interaction_binding_error` before any dispatch.
+
+Managed shell execution uses `asyncio.create_subprocess_exec` with separate bounded drain tasks, a process-group/Windows Job Object backend, and an execution handle recorded under the root owner. The handle reports `requested_cancel`, `graceful_exit`, `forced_exit`, `returncode`, `pid_alive` and `descendant_alive`; drain queues apply backpressure and spill complete bytes to a per-execution artifact when the bounded in-memory limit is reached, recording byte count/hash (no silent truncation). A root crash releases its physical OS handle but leaves the control row in `uncertain/held` quarantine until a new Application explicitly reconciles it. MCP execution is registered in the same supervisor, while its transport close is a separate shutdown phase.
+
 ## Risks / Trade-offs
 
 - **[Risk] commit 后 dispatch 前存在 crash window，无法证明 exactly-once。** → 记录 accepted/dispatch intent 的阶段，重启显式标为 interrupted/uncertain，禁止自动重放；把“可安全查询”和“需人工决策”分开验收。
@@ -136,7 +263,7 @@ TerminalOutputPort 继续复用 `ui.py`，不解析控制台文本来获得状�
 
 ## Migration Plan
 
-1. 在实现前先锁定 C02 handoff（`tasks §6.2`）和现有 store/session/port 的事实，补齐 Application API、owner、migration 和 TUI consumer 的测试夹具边界。
+1. 在实现前先锁定 C02 handoff（`openspec/changes/decouple-runtime-interaction-from-tui/tasks.md §6.2`）和现有 store/session/port 的事实，补齐 Application API、owner、migration 和 TUI consumer 的测试夹具边界；若该段落不存在，必须以当前公开接口核对并记录缺失。
 2. 先添加版本化控制 schema 与只读加载/诊断，再添加写入事务和 workspace lock；老 session 只读兼容，明确迁移版本后才生成新控制记录。
 3. 接入 command idempotency、run state guard、owner supervisor 和 managed shell，再把 `Agent` 的运行和取消回调纳入 Application；每一步先跑 focused tests，保持 C02 canonical tests 作为回归层。
 4. 最后替换 one-shot、REPL、resume 和 TUI 的入口 wiring，运行离线 consumer、同 workspace 多进程争用、交互等待取消、真实子进程超时和恢复不重放测试。
@@ -144,10 +271,12 @@ TerminalOutputPort 继续复用 `ui.py`，不解析控制台文本来获得状�
 
 回滚策略是停止新的 Application wiring，保留 canonical event store 和旧 session 数据，使用兼容读取路径恢复旧入口；不得删除控制记录或覆盖旧 canonical 事实。若迁移失败，保留原版本并让 Application 返回 migration error，待修复后由显式迁移步骤重试。
 
-## Open Questions
+## Resolved implementation parameters
 
-- 现有 `SQLiteRuntimeStore` 的 session 级数据库与 workspace 级控制库最终采用独立文件还是同库独立表，需要在实现前通过 schema/锁竞争实验确认；无论选择哪一种，都不能改变 canonical event 的提交与恢复语义。
-- Windows 平台的独占句柄后端和受管理 shell 的优雅停止/进程树策略需要以最小真实 Python 子进程实验确定；实验结果必须进入测试策略和验收证据，而不是凭 API 名称推断。
-- Application 的公开 Python 方法/返回 dataclass 名称需要在实现任务中一次性冻结，并与点号命令 envelope、C02 `InteractionRequest`/`OutputEvent` 身份字段逐项对应；此问题不允许由 TUI 单独决定。
-- 旧 session 缺少 workspace 绑定时，哪些只读 resume 信息可显示、哪些操作必须拒绝，需要由 migration 测试明确；默认不得按当前工作目录自动认领。
-- shutdown/cancel 的默认 grace timeout 和可配置上限需要基于现有 CLI 退出行为与真实 shell 测试确定；超时分类和“保留 owner”规则不可放宽。
+- control DB 使用 D8 的独立路径与 schema version；canonical store 路径保持 C02 现状。
+- lock namespace、owner capability、interaction Future、plan/REPL contract、cancel generation 和旧 session inspect-only 均按 D9-D12 冻结；实现不能把这些决策重新留给 TUI 或单个测试夹具。
+- Windows 独占句柄、shell grace timeout 和进程树后端仍需以真实本地子进程实验选择具体标准库调用，但实验只能选择实现，不得改变 D8-D12 的可观察语义。
+- C02 handoff 的规范路径为 `openspec/changes/decouple-runtime-interaction-from-tui/tasks.md §6.2`；若当前 checkout 无该段落，必须先记录缺失并以仓库现有 `runtime_ports.py`/`interactions.py`/`agent.py` 的公开接口核对，不得凭旧路径补写事实。
+- root crash 的唯一语义是“物理 OS handle 释放、control owner quarantine held”；新入口必须先执行 `owner.reconcile`，不能把元数据当作物理锁仍持有。
+- 持久 interaction deadline 使用 UTC wall-clock `expires_at`；运行期可同时保存 monotonic 观测值，但重启只按 UTC 和 schema version 判断过期。
+- canonical session store 必须通过显式 `ProjectContext` 解析到 workspace 绑定路径，不能继续依赖导入期全局 `SESSION_DIR` 作为 Application 的事实来源。

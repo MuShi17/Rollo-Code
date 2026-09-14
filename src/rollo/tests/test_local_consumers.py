@@ -607,6 +607,166 @@ def test_actual_agent_sdk_thinking_stream_uses_isolated_partial_kind(
 
 
 @pytest.mark.parametrize("provider", ["anthropic", "openai"])
+def test_thinking_delta_emits_exactly_one_output_event(
+    tmp_path: Path, provider: str
+) -> None:
+    """思考增量只允许发出一个输出事件。
+
+    回归：流式分支曾对同一段思考文本既调 ``_out_thinking``（端口 →
+    ``ui.print_assistant_text``）又调 ``_emit_text``（同样落到
+    ``print_assistant_text``），而无缓冲的 ``sys.stdout.write`` 让控制台出现
+    token 级重复（``LetLet me me``）。正文只有一条 ``_emit_text``，因此不受
+    影响——这正是"只有 think 会重复"的原因。
+    """
+
+    async def scenario() -> None:
+        store = SQLiteRuntimeStore(tmp_path / f"{provider}-thinking-once.sqlite")
+        archive = ArtifactArchive(
+            tmp_path / f"{provider}-thinking-once-artifacts", metadata_store=store
+        )
+        model = "claude-sonnet-4-6" if provider == "anthropic" else "fixture-model"
+        agent = Agent(
+            api_base="https://fixture.invalid/v1" if provider == "openai" else None,
+            api_key="fixture-key",
+            model=model,
+            thinking_effort="low" if provider == "anthropic" else "none",
+            custom_system_prompt="fixture system",
+            is_sub_agent=True,
+            runtime_store=store,
+            artifact_archive=archive,
+            runtime_session_id=f"session-once-{provider}",
+            runtime_run_id=f"run-once-{provider}",
+            runtime_context_id=f"context-once-{provider}",
+        )
+        # 端口在真实 CLI 由 __main__ 注入终端实现；此处记录事件即可，因为重复
+        # 输出必然表现为同一段文本发出两个端口事件。
+        port = RecordingOutputPort()
+        agent.output_port = port
+        agent._ask_count = 1
+        agent._setup_runtime_facade()
+        if provider == "anthropic":
+            agent._anthropic_messages.append({"role": "user", "content": "hello"})
+        else:
+            agent._openai_messages.append({"role": "user", "content": "hello"})
+        captured: list[dict[str, Any]] = []
+        body = (
+            _anthropic_stream_body_with_thinking()
+            if provider == "anthropic"
+            else _openai_stream_body_with_reasoning()
+        )
+        client = _provider_client(provider, captured, response_body=body)
+        try:
+            if provider == "anthropic":
+                agent._anthropic_client = client
+                await agent._call_anthropic_stream()
+            else:
+                agent._openai_client = client
+                await agent._call_openai_stream()
+
+            # 流中还有既有的 "\n" 分隔事件；只按内容文本过滤。
+            thinking = [
+                event.payload["text"]
+                for event in port.events
+                if event.kind == "assistant_thinking" and event.payload["text"].strip()
+            ]
+            text = [
+                event.payload["text"]
+                for event in port.events
+                if event.kind == "assistant_text" and event.payload["text"].strip()
+            ]
+
+            # 夹具只发送一个思考增量与一个正文增量：两者都必须恰好出现一次。
+            # 若思考同时走 `_out_thinking` 与 `_emit_text`，这里会得到 2 个条目。
+            assert thinking == ["plan"]
+            assert text == ["done"]
+        finally:
+            await agent.aclose()
+            await client.close()
+            store.close()
+
+    asyncio.run(scenario())
+
+
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "openai"])
+def test_sub_agent_captured_output_carries_the_body_but_not_the_thinking(
+    tmp_path: Path, provider: str
+) -> None:
+    """子 Agent 的捕获输出只收正文，思考既不重复也不混入返回值。
+
+    这条钉住 ``_emit_text`` 与 ``_out_thinking`` 的分工，而不是它们的重复：
+
+    * ``_out_thinking`` 是**端口**路径。子 Agent 继承父 Agent 的端口
+      （``agent.py`` 构造子 Agent 时传 ``output_port=self.output_port``），
+      而 ``TerminalOutputPort`` 把 ``assistant_thinking`` 与
+      ``assistant_text`` 都交给 ``ui.print_assistant_text``——思考**已经**上屏。
+      因此那里再补一条 ``_emit_text`` 就是重复（``LetLet me me``）。
+    * ``_emit_text`` 是**缓冲**路径：``run_once`` 通过 ``_capture_output`` 设置
+      ``_output_buffer``，正文靠它进入子 Agent 的返回值。
+
+    两者是不同分支，与端口是否为 ``NullOutputPort`` 无关；这正是"删掉思考的
+    ``_emit_text`` 不影响无端口场景"这一说法不成立的地方。
+    """
+
+    async def scenario() -> None:
+        store = SQLiteRuntimeStore(tmp_path / f"{provider}-subagent-buffer.sqlite")
+        archive = ArtifactArchive(
+            tmp_path / f"{provider}-subagent-buffer-artifacts", metadata_store=store
+        )
+        model = "claude-sonnet-4-6" if provider == "anthropic" else "fixture-model"
+        agent = Agent(
+            api_base="https://fixture.invalid/v1" if provider == "openai" else None,
+            api_key="fixture-key",
+            model=model,
+            thinking_effort="low" if provider == "anthropic" else "none",
+            custom_system_prompt="fixture system",
+            is_sub_agent=True,
+            runtime_store=store,
+            artifact_archive=archive,
+            runtime_session_id=f"session-buffer-{provider}",
+            runtime_run_id=f"run-buffer-{provider}",
+            runtime_context_id=f"context-buffer-{provider}",
+        )
+        # ``run_once`` sets this; no output port is installed, so the port path
+        # is a no-op and only the buffer can carry anything to the caller.
+        agent._output_buffer = []
+        agent._ask_count = 1
+        agent._setup_runtime_facade()
+        if provider == "anthropic":
+            agent._anthropic_messages.append({"role": "user", "content": "hello"})
+        else:
+            agent._openai_messages.append({"role": "user", "content": "hello"})
+        captured: list[dict[str, Any]] = []
+        body = (
+            _anthropic_stream_body_with_thinking()
+            if provider == "anthropic"
+            else _openai_stream_body_with_reasoning()
+        )
+        client = _provider_client(provider, captured, response_body=body)
+        try:
+            if provider == "anthropic":
+                agent._anthropic_client = client
+                await agent._call_anthropic_stream()
+            else:
+                agent._openai_client = client
+                await agent._call_openai_stream()
+            buffered = "".join(agent._output_buffer)
+        finally:
+            await agent.aclose()
+            await client.close()
+            store.close()
+
+        assert "done" in buffered, buffered
+        assert "plan" not in buffered, (
+            "thinking must not be folded into the sub-agent's captured output: "
+            f"{buffered!r}"
+        )
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "openai"])
 def test_public_agent_chat_emits_provider_events_through_output_port(
     tmp_path: Path, provider: str
 ) -> None:
